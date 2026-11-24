@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# On-demand decoupled SSH reverse tunnel exposing host adbd (127.0.0.1:5555)
+# to the AVF Debian guest at 127.0.0.1:15555 via OpenSSH ControlMaster.
+set -euo pipefail
+
+SSH_HOST="${AVF_SSH_HOST:-avf}"
+HOST_PORT="${AVF_ADB_HOST_PORT:-5555}"
+GUEST_PORT="${AVF_ADB_GUEST_PORT:-15555}"
+CTL="${AVF_ADB_CTL:-$HOME/.ssh/avf-adb.ctl}"
+
+tunnel_alive() {
+    [[ -S "$CTL" ]] && ssh -S "$CTL" -O check "$SSH_HOST" >/dev/null 2>&1
+}
+
+wait_ctl() {
+    local i=0
+    while [[ "$i" -lt 20 ]]; do
+        if tunnel_alive; then
+            return 0
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: avf-adb {on|off|status}
+
+Manage an independent SSH reverse tunnel for host ADB debugging without
+coupling the forwarding channel to interactive 'ssh avf' sessions.
+
+  on, start   Start tunnel (host 127.0.0.1:5555 -> guest 127.0.0.1:15555)
+              and run 'adb connect' inside the guest if adb is installed.
+  off, stop   Disconnect guest ADB target and close the tunnel cleanly.
+  status      Show tunnel state and guest 'adb devices -l'.
+
+Environment overrides:
+  AVF_SSH_HOST        SSH host alias (default: avf)
+  AVF_ADB_HOST_PORT   Host adbd TCP port (default: 5555)
+  AVF_ADB_GUEST_PORT  Guest loopback port (default: 15555; outside 5555..5585
+                      so guest adb does not auto-probe a duplicate emulator-5554)
+EOF
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+    on|start)
+        if tunnel_alive; then
+            echo "[ok] AVF ADB tunnel already running"
+        else
+            mkdir -p "$(dirname "$CTL")"
+            rm -f "$CTL"
+            ssh -fNT -M -S "$CTL" -o ExitOnForwardFailure=yes \
+                -R "127.0.0.1:${GUEST_PORT}:127.0.0.1:${HOST_PORT}" "$SSH_HOST"
+            wait_ctl || {
+                echo "[err] Tunnel started but control socket did not become ready" >&2
+                exit 1
+            }
+            echo "[ok] AVF ADB tunnel started (host 127.0.0.1:${HOST_PORT} -> guest 127.0.0.1:${GUEST_PORT})"
+        fi
+        ssh "$SSH_HOST" "if command -v adb >/dev/null 2>&1; then adb connect 127.0.0.1:${GUEST_PORT} && adb devices -l; else echo '[info] adb not installed in guest (run: apt install -y adb)'; fi"
+        ;;
+    off|stop)
+        ssh -o ConnectTimeout=3 "$SSH_HOST" \
+            "if pgrep -x adb >/dev/null 2>&1; then adb disconnect 127.0.0.1:${GUEST_PORT} >/dev/null 2>&1 || true; fi" \
+            2>/dev/null || true
+        if tunnel_alive; then
+            ssh -S "$CTL" -O exit "$SSH_HOST" >/dev/null 2>&1 || true
+            rm -f "$CTL"
+            echo "[ok] AVF ADB tunnel stopped"
+        else
+            rm -f "$CTL"
+            echo "[ok] AVF ADB tunnel is not running"
+        fi
+        ;;
+    status)
+        if tunnel_alive; then
+            echo "[on] AVF ADB tunnel is running (127.0.0.1:${HOST_PORT} -> 127.0.0.1:${GUEST_PORT})"
+            ssh -o ConnectTimeout=3 "$SSH_HOST" \
+                "if command -v adb >/dev/null 2>&1; then adb devices -l; fi"
+        else
+            echo "[off] AVF ADB tunnel is stopped"
+        fi
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

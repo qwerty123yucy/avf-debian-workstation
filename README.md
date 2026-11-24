@@ -74,13 +74,20 @@
   avf-vm reset          # 从宿主初始种子还原系统
   avf-vm stop           # 优雅关机
   ```
+- **可选：按需开启宿主机 ADB 调试隧道**：虚拟机默认不暴露宿主机回环接口。如需在 Debian 内通过独立 `adb` 调试本机（前提：宿主已开启 `adb tcpip 5555`，客户机已 `apt install -y adb`），可使用 [`scripts/avf-adb`](scripts/avf-adb)（通过 OpenSSH `ControlMaster` 独立隧道将宿主 `127.0.0.1:5555` 映射至客户机 `127.0.0.1:15555`——与交互 `ssh avf` 解耦以避免退出挂起，并避开 ADB `5555..5585` 本地模拟器扫描段以防重复设备）：
+  ```bash
+  avf-adb on            # 启动独立隧道并在客户机连接 127.0.0.1:15555（首次需在手机弹窗确认授权）
+  avf-adb status        # 查看隧道状态与客户机 adb devices
+  avf-adb off           # 断开连接并关闭隧道
+  ```
 
 ---
 
 ## 已知边界
 
 - **时钟与 NTP**：Debian 主线 ARM64 云内核不驱动 AVF 的 PL030 虚拟 RTC（`RTC time: n/a`）。冷启动或重置后墙钟由 `systemd-timesyncd` 通过 UDP `123` 同步；若所连 VPN 屏蔽 UDP `123`，需放行或手动校时。
-- **Android 私人 DNS（DoT）**：客户机 DNS 查询以 `com.avf.linux` 身份发往当前网络 `LinkProperties` DNS 服务器的 53 端口；开启 VPN 时完整走 VPN 隧道，未开 VPN 时不经过系统级私人 DNS（DoT）。
+- **Android 私人 DNS（DoT）与 `/etc/resolv.conf` 托管**：`vmnet-guest.service` 每次启动都会原子覆写客户机 `/etc/resolv.conf` 为固定虚拟 DNS（`10.0.2.3` / `10.0.2.4`），手动修改该文件会在重启服务或虚拟机后重置。客户机 DNS 查询由宿主 `libvmnet.so` 以 `com.avf.linux` 身份发往当前活跃网络 `LinkProperties` DNS 服务器的 53 端口；开启 VPN 时完整走 VPN 隧道，未开 VPN 时不经过系统级私人 DNS（DoT）。
+- **回环隔离与本地 OAuth 回调**：客户机 `127.0.0.1` 与 Android 宿主机隔离。若客户机内运行的 CLI 认证需要由手机浏览器回调 `http://localhost:<port>`（如部分 Google OAuth / `rclone` 流程），可在宿主机侧通过 `ssh -L <port>:127.0.0.1:<port> avf` 临时转发该端口完成授权。
 - **GenieZone 内存回收**：在 MediaTek GenieZone 平台下客户机内存页按需分配（上限 4 GiB），不会在运行时通过 balloon 自动回缩，停机或重启后释放。
 - **系统 OTA 更新**：部分厂商大版本 OTA 可能重置全局 `hidden_api_blacklist_exemptions`；若更新系统后无法启动 VM，重新执行该条 `settings put` 命令即可。
 - **签名密钥与备份**：若自行编译安装，请妥善备份 `signing/avf-linux.jks`；丢失密钥将无法覆盖升级，卸载 App 会连带清除私有目录中的 `disk.img`。
@@ -94,7 +101,7 @@ app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.5.0
 app/compile-stubs/  编译期 AVF API 最小桩声明（不打包进 DEX）
 vmnet/              Go 源码：宿主 gVisor 双栈网关（libvmnet.so）与客户机隧道（vmnet-guest）
 guest/              客户机 systemd 单元、GRUB/fstab/sysctl/sshd 配置与 provision.sh
-scripts/            build_apk.py、make_golden_seed.py、avf-vm、setup-termux.sh
+scripts/            build_apk.py、make_golden_seed.py、avf-vm、avf-adb、setup-termux.sh
 ```
 
 构建前需准备 Go 1.24+、JDK（`javac`/`keytool`）及 Android SDK Build-Tools（设置 `ANDROID_HOME`）：

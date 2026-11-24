@@ -23,9 +23,13 @@ BIN_DIR="${PREFIX:-/usr/local}/bin"
 mkdir -p "$BIN_DIR" "$HOME/.ssh" "$HOME/.config/avf-linux"
 chmod 700 "$HOME/.ssh" "$HOME/.config/avf-linux"
 
-# 1. Install or update avf-vm CLI
+# 1. Install or update avf-vm & avf-adb CLIs
 install -m 755 "$SCRIPT_DIR/avf-vm" "$BIN_DIR/avf-vm"
 echo "[ok] Installed CLI: $BIN_DIR/avf-vm"
+if [[ -f "$SCRIPT_DIR/avf-adb" ]]; then
+    install -m 755 "$SCRIPT_DIR/avf-adb" "$BIN_DIR/avf-adb"
+    echo "[ok] Installed CLI: $BIN_DIR/avf-adb"
+fi
 
 # 2. Install, reuse, or generate Ed25519 SSH key
 KEY_DST="$HOME/.ssh/id_ed25519_avf_debian"
@@ -137,4 +141,5 @@ echo "  avf-vm start               # start Debian 13 (works with or without ADB)
 echo "  avf-vm wakelock [on|off]   # toggle host CPU WakeLock (default: off)"
 echo "  avf-vm reset               # restore initial Debian 13 image from seed"
 echo "  ssh avf                    # passwordless Ed25519 SSH via local vsock"
+echo "  avf-adb [on|status|off]    # optional decoupled host ADB tunnel (127.0.0.1:15555)"
 echo "  avf-vm stop                # graceful poweroff"
