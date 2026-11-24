@@ -1,0 +1,13 @@
+[Unit]
+Description=AVF Host-Governed Dual-Stack Network Tunnel (vsock:2223)
+After=local-fs.target systemd-udevd.service
+Before=network-online.target ssh.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/vmnet-guest -if vmnet0 -cidr 10.0.2.2/24 -cidr6 fd00:a7f::2/64 -dns 10.0.2.3 -dns2 10.0.2.4 -port 2223
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

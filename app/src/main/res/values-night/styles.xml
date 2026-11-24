@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.AvfLinux" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF101418</item>
+        <item name="android:statusBarColor">#FF101418</item>
+        <item name="android:navigationBarColor">#FF101418</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">#FF7CC8F8</item>
+    </style>
+</resources>

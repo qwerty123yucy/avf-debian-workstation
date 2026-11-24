@@ -1,0 +1,9 @@
+[Unit]
+Description=Forward virtio-vsock:2222 to local OpenSSH daemon
+Requires=sshd-vsock.socket
+Wants=ssh.service
+After=ssh.service sshd-vsock.socket
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=infinity 127.0.0.1:22
+Restart=on-failure

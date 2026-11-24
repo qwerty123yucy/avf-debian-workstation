@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CTL_URL="http://127.0.0.1:2288"
+SSH_PORT="2222"
+ADB_TARGET="${AVF_ADB_TARGET:-127.0.0.1:5555}"
+TOKEN_FILE="${AVF_TOKEN_FILE:-$HOME/.config/avf-linux/token}"
+SSH_KEY="${AVF_SSH_KEY:-$HOME/.ssh/id_ed25519_avf_debian}"
+
+load_token() {
+    if [[ -n "${AVF_TOKEN:-}" ]]; then
+        printf '%s' "$AVF_TOKEN"
+        return 0
+    fi
+    if [[ -r "$TOKEN_FILE" ]]; then
+        tr -d ' \r\n' < "$TOKEN_FILE"
+        return 0
+    fi
+    echo "Error: control token not found at $TOKEN_FILE" >&2
+    echo "Run setup-termux.sh or tap 'Copy Token' in the AVF Linux app and save it there." >&2
+    return 1
+}
+
+api_call() {
+    local method="$1"
+    local path="$2"
+    local token
+    token="$(load_token)" || return 1
+    curl -fsS --connect-timeout 2 --max-time 4 \
+        -X "$method" \
+        -H "Authorization: Bearer $token" \
+        "${CTL_URL}${path}"
+}
+
+adb_ready() {
+    command -v adb >/dev/null 2>&1 || return 1
+    [[ "$(adb -s "$ADB_TARGET" get-state 2>/dev/null || true)" == "device" ]]
+}
+
+wake_service_action() {
+    local action="$1"
+    local intent_act="$2"
+    shift 2
+    local token out
+    token="$(load_token)"
+
+    if adb_ready; then
+        out="$(adb -s "$ADB_TARGET" shell am start-foreground-service --user 0 \
+            -n com.avf.linux/.VmService \
+            -a "$intent_act" \
+            --es token "$token" "$@" 2>&1 || true)"
+        if [[ "$out" != *"Error:"* ]]; then
+            return 0
+        fi
+        adb -s "$ADB_TARGET" shell am start --user 0 \
+            -n com.avf.linux/.MainActivity \
+            --es action "$action" \
+            --es token "$token" \
+            --ez background true >/dev/null 2>&1
+        return 0
+    fi
+
+    if command -v am >/dev/null 2>&1; then
+        am start --user 0 \
+            -n com.avf.linux/.MainActivity \
+            --es action "$action" \
+            --es token "$token" \
+            --ez background true >/dev/null 2>&1
+        return 0
+    fi
+
+    echo "Error: VmService is not running and neither ADB nor Termux 'am' is available." >&2
+    echo "Open the AVF Linux app to start the VM." >&2
+    return 1
+}
+
+json_field() {
+    local json="$1"
+    local key="$2"
+    python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+v = d.get(sys.argv[2], "")
+if isinstance(v, bool):
+    print("true" if v else "false")
+else:
+    print(v)
+' "$json" "$key" 2>/dev/null || true
+}
+
+print_status_json() {
+    local out="$1"
+    python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+state = d.get("state", "UNKNOWN")
+ssh_ep = d.get("ssh_local", "127.0.0.1:2222")
+print(f"State    : {state}")
+print(f"SSH      : {ssh_ep} (alias: ssh avf)")
+if d.get("running"):
+    vmnet = "connected" if d.get("vmnet_connected") else "connecting"
+    nmode = d.get("net_mode", "Host")
+    gip = d.get("guest_ip") or "10.0.2.2"
+    print(f"Network  : {nmode} ({vmnet}, dual-stack {gip} + fd00:a7f::2)")
+mem_mib = d.get("memory_mib", 4096)
+print(f"Memory   : {mem_mib} MiB (on-demand)")
+seed_mb = d.get("seed_mb", 0)
+seed_str = f", golden seed {seed_mb} MiB" if d.get("seed_ready") else ""
+act_mb = d.get("disk_actual_mb", 0)
+log_gb = d.get("disk_logical_gb", 64)
+print(f"Storage  : {act_mb} MiB used / {log_gb} GiB sparse{seed_str}")
+wl_pref = "ON" if d.get("keep_awake") else "OFF"
+wl_held = "held" if d.get("wakelock_held") else "host sleep allowed"
+print(f"WakeLock : {wl_pref} ({wl_held})")
+if d.get("uptime_sec"):
+    up_s = d["uptime_sec"]
+    print(f"Uptime   : {up_s}s")
+if d.get("error"):
+    err_s = d["error"]
+    print(f"Error    : {err_s}")
+' "$out"
+}
+
+cmd_status() {
+    local raw_json=0
+    [[ "${1:-}" == "--json" ]] && raw_json=1
+    local token
+    token="$(load_token)" || return 1
+
+    local out rc=0
+    out="$(curl -fsS --connect-timeout 2 --max-time 4 \
+        -H "Authorization: Bearer $token" \
+        "${CTL_URL}/status" 2>/dev/null)" || rc=$?
+    if (( rc != 0 )); then
+        if (( rc == 22 )); then
+            echo "Error: control token rejected (HTTP 401). Tap 'Copy Token' in AVF Linux and update $TOKEN_FILE." >&2
+            return 1
+        fi
+        if (( rc == 28 )); then
+            if (( raw_json )); then
+                echo '{"running":false,"state":"SUSPENDED_BY_OS"}'
+            else
+                echo "State    : UNRESPONSIVE (frozen by OEM power manager; enable 'Allow background activity' for AVF Linux)"
+            fi
+            return 1
+        fi
+        if (( raw_json )); then
+            echo '{"running":false,"state":"SERVICE_STOPPED"}'
+        else
+            echo "State    : STOPPED (AVF Linux service inactive)"
+        fi
+        return 0
+    fi
+    if (( raw_json )); then
+        echo "$out"
+        return 0
+    fi
+    print_status_json "$out"
+}
+
+wait_for_ssh() {
+    local tries=35
+    for ((i = 1; i <= tries; i++)); do
+        if ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=2 \
+            -o StrictHostKeyChecking=accept-new \
+            root@127.0.0.1 true >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+cmd_start() {
+    load_token >/dev/null
+    local code
+    code="$(api_post_code /start)"
+    case "$code" in
+        200|202) ;;
+        401)
+            echo "Error: control token rejected (HTTP 401). Update $TOKEN_FILE." >&2
+            return 1
+            ;;
+        409)
+            echo "Error: VM is busy importing or resetting; wait for completion first." >&2
+            return 1
+            ;;
+        000)
+            wake_service_action "start" "com.avf.linux.ACTION_START"
+            ;;
+        *)
+            echo "Error: unexpected HTTP $code from /start" >&2
+            return 1
+            ;;
+    esac
+    echo "Starting Debian 13 AVF VM (UEFI)..."
+    if wait_for_ssh; then
+        echo "VM is ready. Connect with: ssh avf"
+        cmd_status
+    else
+        echo "VM started, waiting for SSH timed out. Check 'avf-vm console' or 'avf-vm status'." >&2
+        cmd_status || true
+        return 1
+    fi
+}
+
+cmd_stop() {
+    if ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+        -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new \
+        root@127.0.0.1 "sync && poweroff" >/dev/null 2>&1; then
+        echo "Sent graceful poweroff to Debian 13..."
+        for ((i = 1; i <= 10; i++)); do
+            local st
+            if st="$(api_call GET /status 2>/dev/null)"; then
+                if [[ "$(json_field "$st" running)" == "false" ]]; then
+                    echo "VM stopped cleanly."
+                    return 0
+                fi
+            elif ! ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+                -o BatchMode=yes -o ConnectTimeout=1 -o StrictHostKeyChecking=accept-new \
+                root@127.0.0.1 true >/dev/null 2>&1; then
+                sleep 1
+                echo "VM stopped cleanly."
+                return 0
+            fi
+            sleep 1
+        done
+    fi
+    if api_call POST /stop >/dev/null 2>&1; then
+        echo "Stop requested."
+    else
+        echo "AVF Linux service is not running."
+    fi
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+api_post_code() {
+    local path="$1"
+    local token code=""
+    token="$(load_token)" || return 1
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 4 \
+        -X POST \
+        -H "Authorization: Bearer $token" \
+        "${CTL_URL}${path}" 2>/dev/null)" || true
+    printf '%s' "${code:-000}"
+}
+
+cmd_reset() {
+    load_token >/dev/null
+    if [[ "${1:-}" != "--yes" && "${1:-}" != "-y" ]]; then
+        read -r -p "Erase all VM changes and restore initial Debian 13 image? [y/N] " ans
+        if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+            echo "Aborted."
+            return 0
+        fi
+    fi
+    local code cold_wake=0 saw_busy=0
+    code="$(api_post_code /reset)"
+    case "$code" in
+        200|202) ;;
+        400)
+            echo "Error: golden seed (seed.simg.gz) not found in app storage; cannot reset." >&2
+            return 1
+            ;;
+        401)
+            echo "Error: control token rejected (HTTP 401). Update $TOKEN_FILE." >&2
+            return 1
+            ;;
+        409)
+            echo "Error: another import or reset is already in progress." >&2
+            return 1
+            ;;
+        000)
+            cold_wake=1
+            wake_service_action "reset" "com.avf.linux.ACTION_RESET"
+            ;;
+        *)
+            echo "Error: unexpected HTTP $code from /reset" >&2
+            return 1
+            ;;
+    esac
+    echo "Resetting VM disk from golden seed..."
+    for ((i = 1; i <= 45; i++)); do
+        local st state
+        if st="$(api_call GET /status 2>/dev/null)"; then
+            state="$(json_field "$st" state)"
+            [[ "$state" == "RESETTING" ]] && saw_busy=1
+            if [[ "$state" == "ERROR" ]]; then
+                print_status_json "$st"
+                return 1
+            fi
+            if [[ "$state" == "STOPPED" ]] && (( ! cold_wake || saw_busy || i >= 4 )); then
+                print_status_json "$st"
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    echo "Reset still in progress; check 'avf-vm status'."
+}
+
+cmd_wakelock() {
+    local mode="${1:-status}"
+    local out=""
+    case "$mode" in
+        on)
+            if out="$(api_call POST /wakelock/on 2>/dev/null)"; then
+                print_status_json "$out"
+            else
+                wake_service_action "wakelock_on" "com.avf.linux.ACTION_SET_WAKELOCK" --ez enable true
+                echo "WakeLock ON requested."
+            fi
+            ;;
+        off)
+            if out="$(api_call POST /wakelock/off 2>/dev/null)"; then
+                print_status_json "$out"
+            else
+                wake_service_action "wakelock_off" "com.avf.linux.ACTION_SET_WAKELOCK" --ez enable false
+                echo "WakeLock OFF requested."
+            fi
+            ;;
+        toggle)
+            if out="$(api_call POST /wakelock/toggle 2>/dev/null)"; then
+                print_status_json "$out"
+            else
+                wake_service_action "wakelock_toggle" "com.avf.linux.ACTION_TOGGLE_WAKELOCK"
+                echo "WakeLock toggle requested."
+            fi
+            ;;
+        status)
+            cmd_status
+            ;;
+        *)
+            echo "Usage: avf-vm wakelock [on|off|toggle|status]" >&2
+            return 2
+            ;;
+    esac
+}
+
+cmd_console() {
+    api_call GET /console
+}
+
+cmd_import() {
+    load_token >/dev/null
+    local code cold_wake=0 saw_busy=0
+    code="$(api_post_code /import)"
+    case "$code" in
+        200|202) ;;
+        400)
+            echo "Error: no staged image (seed.simg.gz, disk.simg, or disk.img) found in Android/data/com.avf.linux/files/staging." >&2
+            return 1
+            ;;
+        401)
+            echo "Error: control token rejected (HTTP 401). Update $TOKEN_FILE." >&2
+            return 1
+            ;;
+        409)
+            echo "Error: another import or reset is already in progress." >&2
+            return 1
+            ;;
+        000)
+            cold_wake=1
+            wake_service_action "import" "com.avf.linux.ACTION_IMPORT"
+            ;;
+        *)
+            echo "Error: unexpected HTTP $code from /import" >&2
+            return 1
+            ;;
+    esac
+    echo "Importing VM disk image from staging..."
+    for ((i = 1; i <= 90; i++)); do
+        local st state
+        if st="$(api_call GET /status 2>/dev/null)"; then
+            state="$(json_field "$st" state)"
+            [[ "$state" == "IMPORTING" ]] && saw_busy=1
+            if [[ "$state" == "ERROR" ]]; then
+                print_status_json "$st"
+                return 1
+            fi
+            if [[ "$state" == "STOPPED" ]] && (( ! cold_wake || saw_busy || i >= 4 )); then
+                print_status_json "$st"
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    echo "Import still in progress; check 'avf-vm status'."
+}
+
+cmd_ssh() {
+    exec ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+        -o StrictHostKeyChecking=accept-new \
+        root@127.0.0.1 "$@"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: avf-vm <command>
+
+Commands:
+  start                    Start the Debian 13 AVF VM and wait for SSH
+  stop                     Gracefully power off and stop the VM
+  restart                  Stop and start the VM
+  reset [--yes]            Erase disk changes and restore initial Debian 13 seed image
+  status [--json]          Show VM status (pass --json for raw JSON)
+  wakelock [on|off|toggle] Inspect or change host CPU WakeLock policy (default: off)
+  ssh [cmd]                Open SSH shell (or execute remote command) via loopback vsock
+  console                  Print recent hvc0 kernel/boot console output
+  import                   Import staged seed.simg.gz / disk.simg from Android/data/com.avf.linux/files/staging
+EOF
+}
+
+case "${1:-}" in
+    start)    cmd_start ;;
+    stop)     cmd_stop ;;
+    restart)  cmd_restart ;;
+    reset)    shift; cmd_reset "$@" ;;
+    status)   shift; cmd_status "$@" ;;
+    wakelock) shift; cmd_wakelock "$@" ;;
+    ssh)      shift; cmd_ssh "$@" ;;
+    console)  cmd_console ;;
+    import)   cmd_import ;;
+    -h|--help|help|"") usage ;;
+    *) echo "Unknown command: $1" >&2; usage; exit 2 ;;
+esac

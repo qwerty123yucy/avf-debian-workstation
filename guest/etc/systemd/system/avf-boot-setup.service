@@ -1,0 +1,12 @@
+[Unit]
+Description=AVF Debian disk grow, zram swap, and first-boot SSH host key setup
+After=local-fs.target
+Before=ssh.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/avf-boot-setup.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

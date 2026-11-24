@@ -1,0 +1,9 @@
+[Unit]
+Description=SSH over virtio-vsock (native systemd socket proxy)
+
+[Socket]
+ListenStream=vsock::2222
+Accept=no
+
+[Install]
+WantedBy=sockets.target
