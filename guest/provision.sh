@@ -14,10 +14,16 @@ fi
 
 tar -C "$SCRIPT_DIR" -cf - etc usr | ssh "$TARGET_HOST" 'tar -C / -xf -'
 ssh "$TARGET_HOST" 'systemctl stop vmnet-guest.service 2>/dev/null || true'
-ssh "$TARGET_HOST" 'cat > /usr/local/sbin/vmnet-guest && chmod 755 /usr/local/sbin/vmnet-guest /usr/local/sbin/avf-boot-setup.sh' < "$VMNET_BIN"
+ssh "$TARGET_HOST" 'cat > /usr/local/sbin/vmnet-guest && chmod 755 /usr/local/sbin/vmnet-guest /usr/local/sbin/avf-boot-setup.sh /etc/grub.d/09_avf_dtb' < "$VMNET_BIN"
 ssh "$TARGET_HOST" '
 set -eu
+if ! command -v fdtput >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends device-tree-compiler
+fi
 rm -f /etc/systemd/network/10-avf-dhcp.network
+/usr/local/sbin/avf-boot-setup.sh
+sysctl --system >/dev/null 2>&1 || true
 systemctl daemon-reload
 systemctl enable vmnet-guest.service sshd-vsock.socket avf-boot-setup.service fstrim.timer
 systemctl start sshd-vsock.socket

@@ -30,6 +30,7 @@
 - **内存、CPU 与计时器**：宿主 4 GiB 按需分配 + 客户机 ~`2 GiB LZ4 zram0`（`vm.page-cluster=0` 避免无意义预读）；`CPU_TOPOLOGY_MATCH_HOST` 透传大小核拓扑；保留内核默认 `kernel.watchdog` 与 `vm.stat_interval`（实测在 MediaTek GenieZone 上禁用或拉长这两项会导致宿主 `crosvm` 空闲 CPU 反常暴涨约 35 倍）。
 - **数据完整性、优雅关机与防误操作**：支持从系统文件选择器直接导入下载目录中的 `.simg.gz` / `.simg`；导入前先校验文件头魔数，解包过程写入 `.tmp`、完整读至流末尾触发 GZIP CRC32 校验并 `fsync` 后再原子替换 `disk.img` 与 `seed.simg.gz`。客户机 `vmnet-guest` 监听仅限宿主（`CID=2`）访问的 `vsock:2224` 电源控制端口；宿主在点击 Stop/Restart、导入/重置前、移除最近任务卡片及收到系统关机广播时，先下发 `sync` + `systemctl poweroff` 等待客户机有序卸载文件系统（超时再回退强制停机），并保留上一轮会话的 `last-console.log` 与 `last-vmlog.log` 供排障读取。
 - **生命周期状态机与虚拟化终端**：宿主控制面采用单锁可形式化状态机（`VmController`）隔离物理阶段、目标意图与单次会话资源（`VmSession`），配合同进程 `LocalBinder` 与不可变状态快照避免跨轮次竞态；内置控制台采用流式 VT100/ANSI 行环形缓冲（保留最近 2000 行 / 160 KB，折叠引导阶段冗余空行）与按视口虚拟化绘制的 `Canvas` 终端（流式刷新无重排开销，避免高速引导刷屏导致的空白或卡顿），软键盘采用 `BaseInputConnection` 增量差值发送。
+- **GenieZone 平台 PCI INTx 边沿触发设备树覆盖**：MediaTek GenieZone 平台未提供虚拟 GICv3 ITS（无 MSI-X），`virtio-pci` 外设回退使用独立共享外设中断（`SPI 36..41`）电平触发；同时宿主内核 `gzvm_irqfd` 虽向 `crosvm` 返回支持 `GZVM_IRQFD_FLAG_RESAMPLE`，实际并未接入 `resamplefd`，EL2 亦未在客户机 EOI 后重采样虚拟电平。当新完成事件落入客户机读取 `ISR` 清零至写 `ICC_EOIR1_EL1` 的窗口内时，`crosvm` 的 `interrupt_status` 会持续保持置位并抑制后续 `irqfd` 注入，导致块设备、`vsock` 或串口队列停滞。为此，`avf-boot-setup.service` 在检测到 `GICv3 Level virtio` 中断时，基于当前固件 `/sys/firmware/fdt` 剥离瞬态 `/chosen` 引导属性并将 `/pci/interrupt-map` 触发类型由 `0x4`（高电平）改为 `0x1`（上升沿），生成 `/boot/avf-gzvm-edge.dtb`，再由 `/etc/grub.d/09_avf_dtb` 在后续引导时通过 GRUB `devicetree` 加载（UEFI 内存映射仍由 U-Boot 实时提供，不修改标准 Debian 内核包；具备 GICv3 ITS/MSI-X 的 KVM 平台自动跳过）。
 - **实测基线**（MediaTek Dimensity 9400 / GenieZone / Android 16）：Debian 13 内核 + 用户态启动约 `4.7s`，`journalctl -b -p warning..emerg` 无告警，空闲时宿主 `crosvm` 占整机 CPU ~`0.25%`。
 
 ---
@@ -98,7 +99,7 @@
 ## 目录结构与自行构建
 
 ```text
-app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.7.0）
+app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.7.1）
 app/compile-stubs/  编译期 AVF API 最小桩声明（不打包进 DEX）
 vmnet/              Go 源码：宿主 gVisor 双栈网关（libvmnet.so）与客户机隧道（vmnet-guest）
 guest/              客户机 systemd 单元、GRUB/fstab/sysctl/sshd 配置与 provision.sh

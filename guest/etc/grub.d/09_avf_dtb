@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+prefix="/usr"
+exec_prefix="/usr"
+datarootdir="/usr/share"
+. "$datarootdir/grub/grub-mkconfig_lib"
+
+echo "insmod fdt"
+prepare_grub_to_access_device "${GRUB_DEVICE_BOOT}"
+cat << 'EOF'
+if [ -f /boot/avf-gzvm-edge.dtb ]; then
+    devicetree /boot/avf-gzvm-edge.dtb
+fi
+EOF

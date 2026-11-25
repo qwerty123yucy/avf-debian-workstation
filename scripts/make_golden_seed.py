@@ -154,7 +154,7 @@ systemctl stop systemd-journald.socket systemd-journald-dev-log.socket systemd-j
 rm -rf /var/log/journal/* /run/log/journal/* /root/.bash_history /root/.lesshst /var/lib/apt/lists/* /tmp/* /var/tmp/* 2>/dev/null || true
 mkdir -p /var/log/journal 2>/dev/null || true
 if [ "$SANITIZE_PUBLIC" = "1" ]; then
-    rm -f /root/.ssh/authorized_keys /etc/ssh/ssh_host_* /etc/systemd/network/10-avf-dhcp.network
+    rm -f /root/.ssh/authorized_keys /etc/ssh/ssh_host_* /etc/systemd/network/10-avf-dhcp.network /boot/avf-gzvm-edge.dtb
     truncate -s 0 /etc/machine-id
 fi
 if mountpoint -q /boot/efi; then
