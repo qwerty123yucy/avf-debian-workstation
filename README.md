@@ -28,8 +28,8 @@
 - **零额外拷贝的 vsock 网络路径**：`VmService` 通过 Unix Socket `SCM_RIGHTS` 将 `vsock:2223` FD 直接移交给原生 Go 进程 `libvmnet.so`，无 Java 转发线程；`vmnet-guest` 在 raw FD 上前置 `O_NONBLOCK` 接入 Go epoll 轮询并聚合突发刷写（单次最多 64 包）；`libvmnet.so` 仅在收到 DNS 查询时懒检查 `active-dns.txt` 修改时间，实测空闲 CPU `0.0%`、常驻内存 ~`4.6 MiB`。
 - **稀疏存储与写放大控制**：64 GiB 稀疏盘实际初始占用仅 ~`1.25 GiB`；根分区 `ext4` 启用 `noatime,lazytime,x-systemd.growfs`，配合每周 `fstrim.timer` 回收空洞；`journald` 限制 `SystemMaxUse=128M`；首次启动由 `avf-boot-setup.service`（`After=local-fs.target`）提前完成分区扩容检查与缺失的 SSH 主机密钥自动生成。
 - **内存、CPU 与计时器**：宿主 4 GiB 按需分配 + 客户机 ~`2 GiB LZ4 zram0`（`vm.page-cluster=0` 避免无意义预读）；`CPU_TOPOLOGY_MATCH_HOST` 透传大小核拓扑；保留内核默认 `kernel.watchdog` 与 `vm.stat_interval`（实测在 MediaTek GenieZone 上禁用或拉长这两项会导致宿主 `crosvm` 空闲 CPU 反常暴涨约 35 倍）。
-- **数据完整性与防误操作**：支持从系统文件选择器直接导入下载目录中的 `.simg.gz` / `.simg`；导入前先校验文件头魔数，不中断运行中的 VM；解包过程先写入 `.tmp` 并完整读至流末尾触发 GZIP CRC32 校验，通过后才原子替换 `disk.img` 与 `seed.simg.gz`。
-- **界面与串口输入**：概览刷新（`sStateSeq`）与高频串口输出（`sConsoleSeq`）解耦，串口视窗保留尾部 10 KB；软键盘采用 `BaseInputConnection` 增量差值发送，规避输入法组合词重复或吞字。
+- **数据完整性、优雅关机与防误操作**：支持从系统文件选择器直接导入下载目录中的 `.simg.gz` / `.simg`；导入前先校验文件头魔数，解包过程写入 `.tmp`、完整读至流末尾触发 GZIP CRC32 校验并 `fsync` 后再原子替换 `disk.img` 与 `seed.simg.gz`。客户机 `vmnet-guest` 监听仅限宿主（`CID=2`）访问的 `vsock:2224` 电源控制端口；宿主在点击 Stop/Restart、导入/重置前、移除最近任务卡片及收到系统关机广播时，先下发 `sync` + `systemctl poweroff` 等待客户机有序卸载文件系统（超时再回退强制停机），并保留上一轮会话的 `last-console.log` 与 `last-vmlog.log` 供排障读取。
+- **生命周期状态机与虚拟化终端**：宿主控制面采用单锁可形式化状态机（`VmController`）隔离物理阶段、目标意图与单次会话资源（`VmSession`），配合同进程 `LocalBinder` 与不可变状态快照避免跨轮次竞态；内置控制台采用流式 VT100/ANSI 行环形缓冲（保留最近 2000 行 / 160 KB，折叠引导阶段冗余空行）与按视口虚拟化绘制的 `Canvas` 终端（流式刷新无重排开销，避免高速引导刷屏导致的空白或卡顿），软键盘采用 `BaseInputConnection` 增量差值发送。
 - **实测基线**（MediaTek Dimensity 9400 / GenieZone / Android 16）：Debian 13 内核 + 用户态启动约 `4.7s`，`journalctl -b -p warning..emerg` 无告警，空闲时宿主 `crosvm` 占整机 CPU ~`0.25%`。
 
 ---
@@ -53,11 +53,11 @@
      adb shell pm grant --user 0 com.avf.linux android.permission.POST_NOTIFICATIONS
      adb shell settings put global hidden_api_blacklist_exemptions 'Landroid/system/virtualmachine/'
      ```
-   - 打开 **AVF Linux -> Settings**，在系统电池设置中允许应用后台活动，避免切后台后被系统冻结。
+   - 打开 **AVF Linux -> Settings**，在系统电池设置中允许应用后台活动，并在系统最近任务界面给应用卡片加锁（避免 ColorOS 等系统在未锁卡上滑清理时按包名发送 `SIGKILL` 强杀进程）。
 3. **导入、启动与使用**
    - 在 App 内点击 **Import**，直接选取刚下载的 `seed-debian13-arm64.simg.gz`（等待约 6 秒完成校验与解包）。
    - 点击 **Start VM**，切到 **Console** 标签页等待约 15–20 秒即自动以 `root` 登录 Debian 13（首次启动自动生成本机独立的 `/etc/machine-id` 与 SSH 主机密钥）。
-   - > 说明：内置 **Console** 是基础串口视窗（剥离 ANSI 控制码，不支持 `vim`、`tmux`、`htop` 等全屏终端交互），定位为首次引导与维护抢救；日常开发建议按下方配置本地 SSH 客户端接入。
+   - > 说明：内置 **Console** 是行缓冲串口终端（解析常见行内光标与清行控制码，不支持 `vim`、`tmux`、`htop` 等全屏交替屏幕应用），定位为首次引导与维护抢救；日常开发建议按下方配置本地 SSH 客户端接入。
 
 ---
 
@@ -72,7 +72,8 @@
   avf-vm start          # 启动虚拟机
   avf-vm wakelock on    # 息屏长任务按需持锁（off 恢复默认）
   avf-vm reset          # 从宿主初始种子还原系统
-  avf-vm stop           # 优雅关机
+  avf-vm stop           # 优雅关机并等待停稳
+  avf-vm console --last # 查看上一轮会话保存的串口或 vmlog (--vmlog)
   ```
 - **可选：按需开启宿主机 ADB 调试隧道**：虚拟机默认不暴露宿主机回环接口。如需在 Debian 内通过独立 `adb` 调试本机（前提：宿主已开启 `adb tcpip 5555`，客户机已 `apt install -y adb`），可使用 [`scripts/avf-adb`](scripts/avf-adb)（通过 OpenSSH `ControlMaster` 独立隧道将宿主 `127.0.0.1:5555` 映射至客户机 `127.0.0.1:15555`——与交互 `ssh avf` 解耦以避免退出挂起，并避开 ADB `5555..5585` 本地模拟器扫描段以防重复设备）：
   ```bash
@@ -97,7 +98,7 @@
 ## 目录结构与自行构建
 
 ```text
-app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.5.0）
+app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.7.0）
 app/compile-stubs/  编译期 AVF API 最小桩声明（不打包进 DEX）
 vmnet/              Go 源码：宿主 gVisor 双栈网关（libvmnet.so）与客户机隧道（vmnet-guest）
 guest/              客户机 systemd 单元、GRUB/fstab/sysctl/sshd 配置与 provision.sh

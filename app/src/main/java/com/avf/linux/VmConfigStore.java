@@ -4,6 +4,7 @@ import android.content.Context;
 import android.system.Os;
 import android.system.StructStat;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -12,6 +13,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.Properties;
 
+/**
+ * Cohesive local storage manager for VM images, configuration, auth token,
+ * DNS resolver state, and persisted session logs.
+ */
 public final class VmConfigStore {
     public static final String VM_NAME = "debian13";
     public static final String BOOTLOADER_PATH = "/apex/com.android.virt/etc/u-boot.bin";
@@ -21,10 +26,20 @@ public final class VmConfigStore {
     public static final int DEFAULT_SSH_VSOCK_PORT = 2222;
     public static final int DEFAULT_CTL_PORT = 2288;
 
+    private static final String LAST_CONSOLE_FILE = "last-console.log";
+    private static final String LAST_VMLOG_FILE = "last-vmlog.log";
+    private static final String ACTIVE_DNS_FILE = "active-dns.txt";
+
     private final Context mContext;
+    private final Object mDnsWriteLock = new Object();
+    private String mLastDnsContent = "";
 
     public VmConfigStore(Context context) {
         mContext = context.getApplicationContext();
+    }
+
+    public File getFilesDir() {
+        return mContext.getFilesDir();
     }
 
     public File getVmDir() {
@@ -41,6 +56,10 @@ public final class VmConfigStore {
 
     public File getDiskFile() { return new File(getVmDir(), "disk.img"); }
     public File getSeedFile() { return new File(getVmDir(), "seed.simg.gz"); }
+    public File getDnsFile() { return new File(mContext.getFilesDir(), ACTIVE_DNS_FILE); }
+    public File getSessionVmNetSocket(long sessionId) {
+        return new File(mContext.getFilesDir(), "vmnet-" + sessionId + ".sock");
+    }
 
     public boolean hasImages() {
         return getDiskFile().isFile();
@@ -69,6 +88,76 @@ public final class VmConfigStore {
             if (f.exists()) {
                 f.delete();
             }
+        }
+    }
+
+    public void cleanupStaleVmNetSockets() {
+        File dir = mContext.getFilesDir();
+        File[] files = (dir != null) ? dir.listFiles() : null;
+        if (files == null) return;
+        for (File f : files) {
+            String name = f.getName();
+            if (name.equals("vmnet.sock") || (name.startsWith("vmnet-") && name.endsWith(".sock"))) {
+                f.delete();
+            }
+        }
+    }
+
+    public void writeActiveDns(String content) {
+        if (content == null || content.isEmpty()) return;
+        synchronized (mDnsWriteLock) {
+            File dst = getDnsFile();
+            if (!content.equals(mLastDnsContent) || !dst.isFile()) {
+                if (writeTextAtomically(ACTIVE_DNS_FILE, content)) {
+                    mLastDnsContent = content;
+                }
+            }
+        }
+    }
+
+    public void saveSessionLogs(String consoleText, String vmLogText) {
+        if (consoleText != null && !consoleText.isEmpty()) {
+            writeTextAtomically(LAST_CONSOLE_FILE, consoleText);
+        }
+        if (vmLogText != null && !vmLogText.isEmpty()) {
+            writeTextAtomically(LAST_VMLOG_FILE, vmLogText);
+        }
+    }
+
+    public String readLastConsoleLog() {
+        return readTextQuietly(LAST_CONSOLE_FILE);
+    }
+
+    public String readLastVmLog() {
+        return readTextQuietly(LAST_VMLOG_FILE);
+    }
+
+    private boolean writeTextAtomically(String name, String content) {
+        File dst = new File(mContext.getFilesDir(), name);
+        File tmp = new File(mContext.getFilesDir(), name + ".tmp");
+        try (FileOutputStream fos = new FileOutputStream(tmp)) {
+            fos.write(content.getBytes(StandardCharsets.UTF_8));
+            fos.flush();
+            return tmp.renameTo(dst);
+        } catch (Throwable ignored) {
+            if (tmp.exists()) tmp.delete();
+            return false;
+        }
+    }
+
+    private String readTextQuietly(String name) {
+        File f = new File(mContext.getFilesDir(), name);
+        if (!f.isFile() || f.length() <= 0) return "";
+        try (FileInputStream fis = new FileInputStream(f)) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream((int) Math.min(f.length(), 262144));
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = fis.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+            }
+            return new String(bos.toByteArray(), StandardCharsets.UTF_8);
+        } catch (Throwable ignored) {
+            return "";
         }
     }
 
@@ -136,6 +225,8 @@ public final class VmConfigStore {
         File dst = new File(mContext.getFilesDir(), "vm.properties");
         try (FileOutputStream fos = new FileOutputStream(tmp)) {
             props.store(fos, "AVF Linux settings");
+            fos.flush();
+            fos.getFD().sync();
             tmp.renameTo(dst);
         } catch (IOException ignored) {}
     }

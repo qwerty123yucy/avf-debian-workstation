@@ -10,13 +10,17 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 const (
 	afVsock        = 40
+	vmaddrCidHost  = 2
 	vmaddrCidAny   = 0xFFFFFFFF
 	tunsetiffIoctl = 0x400454ca
 	iffTun         = 0x0001
@@ -153,7 +157,7 @@ func listenVsock(port uint32) (int, error) {
 	return fd, nil
 }
 
-func acceptVsock(lfd int) (int, error) {
+func acceptVsock(lfd int) (int, uint32, error) {
 	var sa rawSockaddrVM
 	saLen := uint32(unsafe.Sizeof(sa))
 	nfd, _, errno := syscall.Syscall(
@@ -163,12 +167,89 @@ func acceptVsock(lfd int) (int, error) {
 		uintptr(unsafe.Pointer(&saLen)),
 	)
 	if errno != 0 {
-		return -1, errno
+		return -1, 0, errno
 	}
 	fd := int(nfd)
 	syscall.CloseOnExec(fd)
 	_ = syscall.SetNonblock(fd, true)
-	return fd, nil
+	return fd, sa.CID, nil
+}
+
+func handlePowerConn(cf *os.File, port uint32, actionPending *atomic.Bool) {
+	defer cf.Close()
+	_ = cf.SetDeadline(time.Now().Add(2 * time.Second))
+	line, err := bufio.NewReaderSize(io.LimitReader(cf, 64), 64).ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return
+	}
+	cmd := strings.ToUpper(strings.TrimSpace(line))
+	switch cmd {
+	case "PING":
+		_, _ = cf.Write([]byte("PONG\n"))
+	case "SYNC":
+		_ = cf.SetDeadline(time.Now().Add(15 * time.Second))
+		syscall.Sync()
+		_, _ = cf.Write([]byte("OK\n"))
+	case "POWEROFF", "REBOOT":
+		_, _ = cf.Write([]byte("OK\n"))
+		_ = cf.Close()
+		if actionPending.CompareAndSwap(false, true) {
+			log.Printf("Host requested graceful %s via vsock:%d", cmd, port)
+			go func(op string) {
+				syscall.Sync()
+				if op == "REBOOT" {
+					if err := runCmd("systemctl", "reboot", "--no-block"); err != nil {
+						_ = runCmd("/sbin/reboot")
+					}
+				} else {
+					if err := runCmd("systemctl", "poweroff", "--no-block"); err != nil {
+						_ = runCmd("/sbin/poweroff")
+					}
+				}
+				time.Sleep(15 * time.Second)
+				actionPending.Store(false)
+			}(cmd)
+		}
+	default:
+		_, _ = cf.Write([]byte("ERR\n"))
+	}
+}
+
+func servePowerControl(port uint32) {
+	lfd, err := listenVsock(port)
+	if err != nil {
+		log.Printf("power control listen(vsock:%d) failed: %v", port, err)
+		return
+	}
+	defer syscall.Close(lfd)
+	log.Printf("Power control listening on AF_VSOCK port %d (host-only)", port)
+
+	var actionPending atomic.Bool
+	sem := make(chan struct{}, 4)
+
+	for {
+		cfd, peerCID, err := acceptVsock(lfd)
+		if err != nil {
+			log.Printf("power control accept error: %v", err)
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		cf := os.NewFile(uintptr(cfd), "vsock-ctl")
+		if peerCID != vmaddrCidHost {
+			log.Printf("power control rejected non-host CID=%d", peerCID)
+			_ = cf.Close()
+			continue
+		}
+		select {
+		case sem <- struct{}{}:
+			go func(f *os.File) {
+				defer func() { <-sem }()
+				handlePowerConn(f, port, &actionPending)
+			}(cf)
+		default:
+			_ = cf.Close()
+		}
+	}
 }
 
 func main() {
@@ -178,6 +259,7 @@ func main() {
 	dnsIP := flag.String("dns", "10.0.2.3", "Primary virtual DNS IP")
 	dnsIP2 := flag.String("dns2", "10.0.2.4", "Secondary virtual DNS IP")
 	port := flag.Uint("port", 2223, "VSOCK listen port")
+	ctlPort := flag.Uint("ctl-port", 2224, "Host-only VSOCK power/control listen port (0 to disable)")
 	flag.Parse()
 
 	tun, tunRaw, err := openTun(*ifName)
@@ -190,6 +272,10 @@ func main() {
 		log.Fatalf("setupGuestNetwork: %v", err)
 	}
 	log.Printf("Configured %s (v4=%s, v6=%s, dns=%s,%s)", *ifName, *cidr, *cidr6, *dnsIP, *dnsIP2)
+
+	if *ctlPort > 0 {
+		go servePowerControl(uint32(*ctlPort))
+	}
 
 	lfd, err := listenVsock(uint32(*port))
 	if err != nil {
@@ -253,7 +339,7 @@ func main() {
 
 	// Accept loop for host connections
 	for {
-		cfd, err := acceptVsock(lfd)
+		cfd, _, err := acceptVsock(lfd)
 		if err != nil {
 			log.Printf("accept error: %v", err)
 			continue

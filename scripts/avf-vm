@@ -183,8 +183,12 @@ cmd_start() {
             echo "Error: control token rejected (HTTP 401). Update $TOKEN_FILE." >&2
             return 1
             ;;
+        400)
+            echo "Error: VM disk image not found; import or restore an image first." >&2
+            return 1
+            ;;
         409)
-            echo "Error: VM is busy importing or resetting; wait for completion first." >&2
+            echo "Error: VM is busy (starting, stopping, importing, or resetting); wait for completion first." >&2
             return 1
             ;;
         000)
@@ -207,35 +211,59 @@ cmd_start() {
 }
 
 cmd_stop() {
-    if ssh -i "$SSH_KEY" -p "$SSH_PORT" \
-        -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new \
-        root@127.0.0.1 "sync && poweroff" >/dev/null 2>&1; then
-        echo "Sent graceful poweroff to Debian 13..."
-        for ((i = 1; i <= 10; i++)); do
-            local st
+    local code
+    code="$(api_post_code /stop)"
+    if [[ "$code" == "200" || "$code" == "202" ]]; then
+        echo "Stopping Debian 13 gracefully..."
+        for ((i = 1; i <= 20; i++)); do
+            local st state
             if st="$(api_call GET /status 2>/dev/null)"; then
-                if [[ "$(json_field "$st" running)" == "false" ]]; then
+                state="$(json_field "$st" state)"
+                if [[ "$state" == "STOPPED" || "$state" == "ERROR" ]]; then
                     echo "VM stopped cleanly."
                     return 0
                 fi
-            elif ! ssh -i "$SSH_KEY" -p "$SSH_PORT" \
-                -o BatchMode=yes -o ConnectTimeout=1 -o StrictHostKeyChecking=accept-new \
-                root@127.0.0.1 true >/dev/null 2>&1; then
-                sleep 1
+            else
                 echo "VM stopped cleanly."
                 return 0
             fi
             sleep 1
         done
+        echo "Stop requested (still finishing shutdown)."
+        return 0
     fi
-    if api_call POST /stop >/dev/null 2>&1; then
-        echo "Stop requested."
-    else
-        echo "AVF Linux service is not running."
+    if ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+        -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new \
+        root@127.0.0.1 "sync && poweroff" >/dev/null 2>&1; then
+        echo "Sent graceful poweroff over SSH..."
+        return 0
     fi
+    echo "AVF Linux service is not running."
 }
 
 cmd_restart() {
+    load_token >/dev/null
+    local code
+    code="$(api_post_code /restart)"
+    if [[ "$code" == "202" || "$code" == "200" ]]; then
+        echo "Restarting Debian 13 gracefully..."
+        for ((i = 1; i <= 20; i++)); do
+            local st state
+            if st="$(api_call GET /status 2>/dev/null)"; then
+                state="$(json_field "$st" state)"
+                [[ "$state" != "STOPPING" ]] && break
+            fi
+            sleep 1
+        done
+        if wait_for_ssh; then
+            echo "VM is ready. Connect with: ssh avf"
+            cmd_status
+            return 0
+        fi
+        echo "Restart initiated, waiting for SSH timed out. Check 'avf-vm status'." >&2
+        cmd_status || true
+        return 1
+    fi
     cmd_stop
     sleep 1
     cmd_start
@@ -345,7 +373,11 @@ cmd_wakelock() {
 }
 
 cmd_console() {
-    api_call GET /console
+    case "${1:-}" in
+        --last)  api_call GET /console/last ;;
+        --vmlog) api_call GET /vmlog/last ;;
+        *)       api_call GET /console ;;
+    esac
 }
 
 cmd_import() {
@@ -413,7 +445,7 @@ Commands:
   status [--json]          Show VM status (pass --json for raw JSON)
   wakelock [on|off|toggle] Inspect or change host CPU WakeLock policy (default: off)
   ssh [cmd]                Open SSH shell (or execute remote command) via loopback vsock
-  console                  Print recent hvc0 kernel/boot console output
+  console [--last|--vmlog] Print hvc0 console (or previous session / crosvm log)
   import                   Import staged seed.simg.gz / disk.simg from Android/data/com.avf.linux/files/staging
 EOF
 }
@@ -426,7 +458,7 @@ case "${1:-}" in
     status)   shift; cmd_status "$@" ;;
     wakelock) shift; cmd_wakelock "$@" ;;
     ssh)      shift; cmd_ssh "$@" ;;
-    console)  cmd_console ;;
+    console)  shift; cmd_console "$@" ;;
     import)   cmd_import ;;
     -h|--help|help|"") usage ;;
     *) echo "Unknown command: $1" >&2; usage; exit 2 ;;

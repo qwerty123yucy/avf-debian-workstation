@@ -4,8 +4,10 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.content.res.Configuration;
@@ -19,7 +21,9 @@ import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.text.InputType;
@@ -34,7 +38,6 @@ import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -170,7 +173,8 @@ public class MainActivity extends Activity {
                 for (int i = 0; i < backspaces; i++) bos.write(0x7f);
                 byte[] addBytes = added.getBytes(StandardCharsets.UTF_8);
                 bos.write(addBytes, 0, addBytes.length);
-                VmService.sendConsoleInput(bos.toByteArray());
+                sendConsoleInput(bos.toByteArray());
+                scrollConsoleToBottom();
             }
             mComposing = finish ? "" : next;
         }
@@ -215,7 +219,8 @@ public class MainActivity extends Activity {
                     }
                     byte[] del = new byte[count];
                     for (int i = 0; i < count; i++) del[i] = 0x7f;
-                    VmService.sendConsoleInput(del);
+                    sendConsoleInput(del);
+                    scrollConsoleToBottom();
                     clearStickyModifiers();
                     return true;
                 }
@@ -240,6 +245,12 @@ public class MainActivity extends Activity {
     }
 
     private VmConfigStore mStore;
+    private VmStatus mFallbackStatus;
+    private VmService mService;
+    private boolean mBound = false;
+    private boolean mResumed = false;
+    private String mPendingAutoAction;
+    private boolean mPendingAutoBackground = false;
     private Palette mPal;
 
     private View mStatusDot;
@@ -268,9 +279,9 @@ public class MainActivity extends Activity {
     private AlertDialog mConfirmDialog;
 
     private TextView mConsoleMeta;
+    private TextView mBtnJumpBottom;
     private TextView mBtnKeyboard;
-    private TextView mConsoleView;
-    private ScrollView mConsoleScroll;
+    private ConsoleView mConsoleView;
     private TerminalInputView mTermInput;
 
     private boolean mCtrlArmed = false;
@@ -281,24 +292,81 @@ public class MainActivity extends Activity {
     private TextView mKeyShift;
     private boolean mKeyboardVisible = false;
 
-    private static final int CONSOLE_WINDOW_CHARS = 10240;
+    private static final long CONSOLE_FLUSH_MIN_MS = 33L;
 
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean mFlushScheduled = new AtomicBoolean(false);
+    private final VmController.Listener mVmListener = this::scheduleUiFlush;
+    private volatile long mLastFlushUptimeMs = 0L;
     private long mLastStateSeq = -1L;
     private long mLastConsoleSeq = -1L;
+
+    private final ServiceConnection mServiceConn = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder binder) {
+            if (!(binder instanceof VmService.LocalBinder)) return;
+            mService = ((VmService.LocalBinder) binder).getService();
+            if (mResumed) {
+                mService.getController().addListener(mVmListener);
+            }
+            runPendingAutoActionIfReady();
+            mLastStateSeq = -1L;
+            mLastConsoleSeq = -1L;
+            refreshUi();
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            mService = null;
+            mLastStateSeq = -1L;
+            refreshUi();
+        }
+    };
 
     private final Runnable mUiFlushRunnable = new Runnable() {
         @Override
         public void run() {
             mFlushScheduled.set(false);
+            mLastFlushUptimeMs = SystemClock.uptimeMillis();
             refreshUi();
         }
     };
 
     private void scheduleUiFlush() {
         if (mFlushScheduled.compareAndSet(false, true)) {
-            mHandler.postDelayed(mUiFlushRunnable, 16);
+            long elapsed = SystemClock.uptimeMillis() - mLastFlushUptimeMs;
+            long delay = (elapsed >= CONSOLE_FLUSH_MIN_MS) ? 0L : (CONSOLE_FLUSH_MIN_MS - elapsed);
+            if (delay == 0L) {
+                mHandler.post(mUiFlushRunnable);
+            } else {
+                mHandler.postDelayed(mUiFlushRunnable, delay);
+            }
+        }
+    }
+
+    private VmStatus currentStatus() {
+        if (mService != null) {
+            return mService.getStatus();
+        }
+        return mFallbackStatus;
+    }
+
+    private ConsoleBuffer currentConsole() {
+        if (mService != null) {
+            return mService.getController().getConsole();
+        }
+        return null;
+    }
+
+    private void sendConsoleInput(byte[] data) {
+        if (mService != null) {
+            mService.sendConsoleInput(data);
+        }
+    }
+
+    private void scrollConsoleToBottom() {
+        if (mConsoleView != null) {
+            mConsoleView.scrollToBottom();
         }
     }
 
@@ -306,10 +374,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         mStore = new VmConfigStore(this);
-        if (VmService.getInstance() == null) {
-            Properties p = mStore.loadSettings();
-            VmService.sKeepAwake = mStore.getBoolProp(p, "keep_awake", false);
-        }
+        mFallbackStatus = VmStatus.fromStore(0L, mStore);
         boolean isDark = (getResources().getConfiguration().uiMode
             & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
         mPal = new Palette(isDark);
@@ -318,7 +383,17 @@ public class MainActivity extends Activity {
         if (savedInstanceState != null && savedInstanceState.getBoolean(STATE_SHOWING_CONSOLE, false)) {
             switchTab(true);
         }
-        handleAutoIntent(getIntent());
+        captureAutoIntent(getIntent());
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        Intent svc = new Intent(this, VmService.class);
+        try {
+            startService(svc);
+        } catch (Throwable ignored) {}
+        mBound = bindService(svc, mServiceConn, Context.BIND_AUTO_CREATE);
     }
 
     @Override
@@ -331,7 +406,8 @@ public class MainActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        handleAutoIntent(intent);
+        captureAutoIntent(intent);
+        runPendingAutoActionIfReady();
     }
 
     private void configureSystemBars() {
@@ -345,41 +421,75 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void handleAutoIntent(Intent intent) {
+    private void captureAutoIntent(Intent intent) {
         if (intent == null) return;
         String action = intent.getStringExtra("action");
         String tok = intent.getStringExtra("token");
         if (action != null && mStore.getOrCreateToken().equals(tok)) {
-            if ("start".equals(action)) sendVmAction(VmService.ACTION_START);
-            else if ("stop".equals(action)) sendVmAction(VmService.ACTION_STOP);
-            else if ("restart".equals(action)) sendVmAction(VmService.ACTION_RESTART);
-            else if ("import".equals(action)) sendVmAction(VmService.ACTION_IMPORT);
-            else if ("reset".equals(action)) sendVmAction(VmService.ACTION_RESET);
-            else if ("wakelock_on".equals(action)) sendWakeLockSet(true);
-            else if ("wakelock_off".equals(action)) sendWakeLockSet(false);
-            else if ("wakelock_toggle".equals(action)) sendVmAction(VmService.ACTION_TOGGLE_WAKELOCK);
+            mPendingAutoAction = action;
+            mPendingAutoBackground = intent.getBooleanExtra("background", false);
             intent.removeExtra("action");
-            if (intent.getBooleanExtra("background", false)) {
-                moveTaskToBack(true);
-            }
+        }
+    }
+
+    private void runPendingAutoActionIfReady() {
+        if (mPendingAutoAction == null) return;
+        String action = mPendingAutoAction;
+        boolean goBack = mPendingAutoBackground;
+        mPendingAutoAction = null;
+        mPendingAutoBackground = false;
+
+        if ("start".equals(action)) sendVmAction(VmService.ACTION_START);
+        else if ("stop".equals(action)) sendVmAction(VmService.ACTION_STOP);
+        else if ("restart".equals(action)) sendVmAction(VmService.ACTION_RESTART);
+        else if ("import".equals(action)) sendVmAction(VmService.ACTION_IMPORT);
+        else if ("reset".equals(action)) sendVmAction(VmService.ACTION_RESET);
+        else if ("wakelock_on".equals(action)) sendWakeLockSet(true);
+        else if ("wakelock_off".equals(action)) sendWakeLockSet(false);
+        else if ("wakelock_toggle".equals(action)) sendVmAction(VmService.ACTION_TOGGLE_WAKELOCK);
+
+        if (goBack) {
+            moveTaskToBack(true);
         }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        mResumed = true;
         mLastStateSeq = -1L;
         mLastConsoleSeq = -1L;
-        VmService.setUiListener(this::scheduleUiFlush);
+        if (mService != null) {
+            mService.getController().addListener(mVmListener);
+            runPendingAutoActionIfReady();
+        }
         refreshUi();
     }
 
     @Override
     protected void onPause() {
-        VmService.setUiListener(null);
+        mResumed = false;
+        if (mService != null) {
+            mService.getController().removeListener(mVmListener);
+        }
         mHandler.removeCallbacks(mUiFlushRunnable);
         mFlushScheduled.set(false);
         super.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        if (mService != null) {
+            mService.getController().removeListener(mVmListener);
+        }
+        if (mBound) {
+            try {
+                unbindService(mServiceConn);
+            } catch (Throwable ignored) {}
+            mBound = false;
+        }
+        mService = null;
+        super.onStop();
     }
 
     @Override
@@ -552,7 +662,7 @@ public class MainActivity extends Activity {
         row1Lp.topMargin = dp(16);
 
         mBtnPrimary = makePillButton("Start VM", 48, v -> {
-            boolean running = "RUNNING".equals(VmService.sState);
+            boolean running = (currentStatus().state == VmStatus.State.RUNNING);
             sendVmAction(running ? VmService.ACTION_STOP : VmService.ACTION_START);
         });
         LinearLayout.LayoutParams pLp = new LinearLayout.LayoutParams(0, dp(48), 1.35f);
@@ -622,12 +732,30 @@ public class MainActivity extends Activity {
         mConsoleMeta = new TextView(this);
         mConsoleMeta.setTextSize(12f);
         mConsoleMeta.setTextColor(mPal.onSurfaceVariant);
+        mConsoleMeta.setSingleLine(true);
+        mConsoleMeta.setEllipsize(TextUtils.TruncateAt.END);
         conHdr.addView(mConsoleMeta, new LinearLayout.LayoutParams(
             0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
+        mBtnJumpBottom = new TextView(this);
+        mBtnJumpBottom.setText("↓ Live");
+        mBtnJumpBottom.setTextSize(11.5f);
+        mBtnJumpBottom.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        mBtnJumpBottom.setTextColor(mPal.onPrimaryContainer);
+        mBtnJumpBottom.setBackground(pillButtonBg(mPal.primaryContainer, 0, 12));
+        mBtnJumpBottom.setPadding(dp(10), dp(4), dp(10), dp(4));
+        mBtnJumpBottom.setVisibility(View.GONE);
+        mBtnJumpBottom.setOnClickListener(v -> scrollConsoleToBottom());
+        LinearLayout.LayoutParams jbLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        jbLp.rightMargin = dp(4);
+        conHdr.addView(mBtnJumpBottom, jbLp);
+
         mBtnKeyboard = makeHeaderAction("Keyboard", v -> toggleKeyboard());
         TextView clearBtn = makeHeaderAction("Clear", v -> {
-            VmService.clearConsole();
+            if (mService != null) {
+                mService.getController().clearConsole();
+            }
             mLastConsoleSeq = -1L;
             refreshUi();
         });
@@ -635,22 +763,22 @@ public class MainActivity extends Activity {
         conHdr.addView(clearBtn);
         mConsolePage.addView(conHdr, chLp);
 
-        mConsoleScroll = new ScrollView(this);
-        mConsoleScroll.setBackground(roundRect(mPal.consoleBg, mPal.outlineVariant, 16));
-        mConsoleScroll.setVerticalScrollBarEnabled(true);
-        mConsoleScroll.setFillViewport(true);
-
-        mConsoleView = new TextView(this);
-        mConsoleView.setTextColor(mPal.consoleText);
-        mConsoleView.setTextSize(11f);
-        mConsoleView.setTypeface(loadMonoFont());
-        mConsoleView.setLineSpacing(dp(2), 1.05f);
+        mConsoleView = new ConsoleView(this);
+        mConsoleView.setBackground(roundRect(mPal.consoleBg, mPal.outlineVariant, 16));
         mConsoleView.setPadding(dp(12), dp(10), dp(12), dp(10));
-        mConsoleView.setOnClickListener(v -> showKeyboard());
-        mConsoleScroll.addView(mConsoleView);
-        mConsoleScroll.setOnClickListener(v -> showKeyboard());
+        int cursorColor = (mPal.primary & 0x00FFFFFF) | 0x55000000;
+        mConsoleView.configureStyle(loadMonoFont(), mPal.consoleText, mPal.onSurfaceVariant, cursorColor);
+        mConsoleView.setOnTapListener(this::showKeyboard);
+        mConsoleView.setOnLongPressListener(() -> {
+            ConsoleBuffer con = currentConsole();
+            String snap = (con != null) ? con.getTextSnapshot() : "";
+            if (!snap.isEmpty()) {
+                copyText(snap, "Copied console output");
+            }
+        });
+        mConsoleView.setOnFollowChangedListener(following -> updateConsoleHeader());
 
-        mConsolePage.addView(mConsoleScroll, new LinearLayout.LayoutParams(
+        mConsolePage.addView(mConsoleView, new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
         mConsolePage.addView(buildExtraKeysBar());
@@ -671,8 +799,8 @@ public class MainActivity extends Activity {
             if (kbNow != mKeyboardVisible) {
                 mKeyboardVisible = kbNow;
                 mBtnKeyboard.setText(kbNow ? "Hide KB" : "Keyboard");
-                if (kbNow && mShowingConsole) {
-                    mConsoleScroll.post(() -> mConsoleScroll.fullScroll(View.FOCUS_DOWN));
+                if (kbNow && mShowingConsole && mConsoleView != null && mConsoleView.isFollowingTail()) {
+                    mConsoleView.invalidate();
                 }
             }
         });
@@ -704,7 +832,6 @@ public class MainActivity extends Activity {
         if (toConsole) {
             mLastConsoleSeq = -1L;
             refreshUi();
-            mConsoleScroll.post(() -> mConsoleScroll.fullScroll(View.FOCUS_DOWN));
         }
     }
 
@@ -786,16 +913,15 @@ public class MainActivity extends Activity {
     }
 
     private void sendImportUri(Uri uri) {
+        // Always dispatch via Intent with FLAG_GRANT_READ_URI_PERMISSION so Android's
+        // UriGrantsManager binds the temporary SAF read grant to VmService's ServiceRecord,
+        // surviving even if the user closes MainActivity before disk import finishes.
         Intent i = new Intent(this, VmService.class);
         i.setAction(VmService.ACTION_IMPORT);
         i.putExtra(VmService.EXTRA_TOKEN, mStore.getOrCreateToken());
         i.setData(uri);
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         startForegroundService(i);
-        mHandler.postDelayed(() -> {
-            mLastStateSeq = -1L;
-            refreshUi();
-        }, 300);
     }
 
     private void showDestructiveDialog(
@@ -904,15 +1030,8 @@ public class MainActivity extends Activity {
     }
 
     private void toggleWakeLockPref() {
-        boolean next = !VmService.sKeepAwake;
-        if (VmService.getInstance() != null) {
-            sendWakeLockSet(next);
-        } else {
-            VmService.sKeepAwake = next;
-            mStore.saveKeepAwake(next);
-            mLastStateSeq = -1L;
-            refreshUi();
-        }
+        boolean next = !currentStatus().keepAwake;
+        sendWakeLockSet(next);
         Toast.makeText(this,
             next ? "WakeLock ON (host CPU stays awake while VM runs)"
                  : "WakeLock OFF (host sleep allowed)",
@@ -920,15 +1039,18 @@ public class MainActivity extends Activity {
     }
 
     private void sendWakeLockSet(boolean enable) {
+        if (mService != null) {
+            mService.setKeepAwake(enable);
+            return;
+        }
+        mStore.saveKeepAwake(enable);
+        mFallbackStatus = mFallbackStatus.withKeepAwake(mFallbackStatus.seq + 1, enable, false);
         Intent i = new Intent(this, VmService.class);
         i.setAction(VmService.ACTION_SET_WAKELOCK);
         i.putExtra(VmService.EXTRA_TOKEN, mStore.getOrCreateToken());
         i.putExtra(VmService.EXTRA_ENABLE, enable);
         startForegroundService(i);
-        mHandler.postDelayed(() -> {
-            mLastStateSeq = -1L;
-            refreshUi();
-        }, 200);
+        refreshUi();
     }
 
     private void openAppSettings() {
@@ -1052,7 +1174,8 @@ public class MainActivity extends Activity {
 
     private void sendRawAndReset(byte[] bytes) {
         if (mTermInput != null) mTermInput.resetComposing();
-        VmService.sendConsoleInput(bytes);
+        sendConsoleInput(bytes);
+        scrollConsoleToBottom();
         clearStickyModifiers();
     }
 
@@ -1069,7 +1192,8 @@ public class MainActivity extends Activity {
         if (text == null || text.isEmpty()) return;
         boolean modActive = mCtrlArmed || mAltArmed || mShiftArmed;
         if (!modActive) {
-            VmService.sendConsoleInput(text.getBytes(StandardCharsets.UTF_8));
+            sendConsoleInput(text.getBytes(StandardCharsets.UTF_8));
+            scrollConsoleToBottom();
             return;
         }
         StringBuilder sb = new StringBuilder();
@@ -1089,7 +1213,8 @@ public class MainActivity extends Activity {
             }
             sb.append(ch);
         }
-        VmService.sendConsoleInput(sb.toString().getBytes(StandardCharsets.UTF_8));
+        sendConsoleInput(sb.toString().getBytes(StandardCharsets.UTF_8));
+        scrollConsoleToBottom();
         clearStickyModifiers();
     }
 
@@ -1213,14 +1338,19 @@ public class MainActivity extends Activity {
     }
 
     private void sendVmAction(String action) {
+        if (mService != null) {
+            if (VmService.ACTION_START.equals(action)) mService.requestStart();
+            else if (VmService.ACTION_STOP.equals(action)) mService.requestStop();
+            else if (VmService.ACTION_RESTART.equals(action)) mService.requestRestart();
+            else if (VmService.ACTION_IMPORT.equals(action)) mService.requestImportStaging();
+            else if (VmService.ACTION_RESET.equals(action)) mService.requestReset();
+            else if (VmService.ACTION_TOGGLE_WAKELOCK.equals(action)) mService.toggleKeepAwake();
+            return;
+        }
         Intent i = new Intent(this, VmService.class);
         i.setAction(action);
         i.putExtra(VmService.EXTRA_TOKEN, mStore.getOrCreateToken());
         startForegroundService(i);
-        mHandler.postDelayed(() -> {
-            mLastStateSeq = -1L;
-            refreshUi();
-        }, 300);
     }
 
     private void copyText(String text, String msg) {
@@ -1232,12 +1362,14 @@ public class MainActivity extends Activity {
     }
 
     private void refreshUi() {
-        long stateSeq = VmService.getStateSeq();
-        if (stateSeq != mLastStateSeq) {
+        final VmStatus status = currentStatus();
+        long stateSeq = status.seq;
+        boolean stateChanged = (stateSeq != mLastStateSeq);
+        if (stateChanged) {
             mLastStateSeq = stateSeq;
             boolean hasManage = checkSelfPermission(PERM_MANAGE_VM) == PackageManager.PERMISSION_GRANTED;
             boolean hasCustom = checkSelfPermission(PERM_CUSTOM_VM) == PackageManager.PERMISSION_GRANTED;
-            String st = VmService.sState;
+            VmStatus.State st = status.state;
             long actualMb = mStore.getActualDiskBytes() / (1024L * 1024L);
             boolean imgs = mStore.hasImages();
             boolean hasSeed = mStore.hasSeed();
@@ -1252,8 +1384,8 @@ public class MainActivity extends Activity {
                 mPermBanner.setVisibility(View.GONE);
             }
 
-            boolean running = "RUNNING".equals(st);
-            boolean busy = "STARTING".equals(st) || "IMPORTING".equals(st) || "RESETTING".equals(st);
+            boolean running = (st == VmStatus.State.RUNNING);
+            boolean busy = st.isBusy();
 
             int chipBg, chipFg, dotColor;
             String niceState;
@@ -1262,10 +1394,11 @@ public class MainActivity extends Activity {
                 niceState = "Running";
             } else if (busy) {
                 chipBg = mPal.warnContainer; chipFg = mPal.onWarnContainer; dotColor = mPal.warnDot;
-                if ("STARTING".equals(st)) niceState = "Starting";
-                else if ("RESETTING".equals(st)) niceState = "Resetting";
+                if (st == VmStatus.State.STARTING) niceState = "Starting";
+                else if (st == VmStatus.State.STOPPING) niceState = "Stopping";
+                else if (st == VmStatus.State.RESETTING) niceState = "Resetting";
                 else niceState = "Importing";
-            } else if ("ERROR".equals(st)) {
+            } else if (st == VmStatus.State.ERROR) {
                 chipBg = mPal.errorContainer; chipFg = mPal.onErrorContainer; dotColor = mPal.errDot;
                 niceState = "Error";
             } else {
@@ -1279,20 +1412,20 @@ public class MainActivity extends Activity {
 
             int cores = Runtime.getRuntime().availableProcessors();
             mValCpu.setText(cores + " vCPU (Host)");
-            mValMem.setText((VmService.sMemMib / 1024) + " GiB on-demand");
+            mValMem.setText((status.memMib / 1024) + " GiB on-demand");
             if (actualMb > 0) {
-                mValDisk.setText(String.format("%.1f / %d GiB", actualMb / 1024.0, VmService.sDiskGb));
+                mValDisk.setText(String.format("%.1f / %d GiB", actualMb / 1024.0, status.diskGb));
             } else {
-                mValDisk.setText(imgs ? (VmService.sDiskGb + " GiB sparse") : "Not imported");
+                mValDisk.setText(imgs ? (status.diskGb + " GiB sparse") : "Not imported");
             }
-            mValNet.setText(running ? (VmService.sVmNetConnected ? VmService.sNetMode : "Connecting...") : "Offline");
+            mValNet.setText(running ? (status.vmNetConnected ? status.netMode : "Connecting...") : "Offline");
 
-            mEndpointLine.setText("ssh 127.0.0.1:" + VmService.sSshPort
-                + "  ·  ctl :" + VmService.sCtlPort);
+            mEndpointLine.setText("ssh 127.0.0.1:" + status.sshPort
+                + "  ·  ctl :" + status.ctlPort);
 
-            if (!VmService.sLastError.isEmpty()) {
+            if (!status.lastError.isEmpty()) {
                 mErrorLine.setVisibility(View.VISIBLE);
-                mErrorLine.setText(VmService.sLastError);
+                mErrorLine.setText(status.lastError);
             } else {
                 mErrorLine.setVisibility(View.GONE);
             }
@@ -1323,7 +1456,7 @@ public class MainActivity extends Activity {
             mBtnReset.setTextColor(mPal.errDot);
             mBtnReset.setBackground(pillButtonBg(mPal.surfaceContainer, mPal.outlineVariant, 20));
 
-            if (VmService.sKeepAwake) {
+            if (status.keepAwake) {
                 mBtnWakeLock.setText("WakeLock: On");
                 mBtnWakeLock.setTextColor(mPal.onWarnContainer);
                 mBtnWakeLock.setBackground(pillButtonBg(mPal.warnContainer, 0, 20));
@@ -1333,27 +1466,37 @@ public class MainActivity extends Activity {
             }
         }
 
-        long seq = VmService.getConsoleSeq();
-        if (seq != mLastConsoleSeq) {
-            boolean wasInitial = (mLastConsoleSeq < 0);
-            mLastConsoleSeq = seq;
-            int totalLen = VmService.getConsoleLength();
-            if (totalLen == 0) {
-                mConsoleMeta.setText("hvc0");
-                mConsoleView.setText("Tap here to type when VM is running.");
-            } else {
-                boolean nearBottom = wasInitial || (mConsoleScroll.getHeight() == 0)
-                    || (mConsoleView.getBottom() - (mConsoleScroll.getScrollY() + mConsoleScroll.getHeight()) <= dp(80));
-                mConsoleMeta.setText("hvc0 · " + Math.max(1, totalLen / 1024) + " KB");
-                mConsoleView.setText(VmService.getConsoleTail(CONSOLE_WINDOW_CHARS));
-                if (mShowingConsole && nearBottom) {
-                    mConsoleScroll.post(() -> {
-                        int bottom = Math.max(0, mConsoleView.getBottom() - mConsoleScroll.getHeight()
-                            + mConsoleScroll.getPaddingBottom());
-                        mConsoleScroll.scrollTo(0, bottom);
-                    });
-                }
+        if (mShowingConsole) {
+            ConsoleBuffer con = currentConsole();
+            long seq = (con != null) ? con.getSeq() : 0L;
+            if (seq != mLastConsoleSeq || stateChanged) {
+                mLastConsoleSeq = seq;
+                ConsoleBuffer.Snapshot snap = (con != null) ? con.snapshot() : null;
+                boolean showCursor = status.state.showsConsoleCursor();
+                mConsoleView.updateSnapshot(snap, showCursor);
+                updateConsoleHeader(con);
             }
+        }
+    }
+
+    private void updateConsoleHeader() {
+        updateConsoleHeader(currentConsole());
+    }
+
+    private void updateConsoleHeader(ConsoleBuffer con) {
+        if (mConsoleMeta == null || mConsoleView == null) return;
+        int lines = (con != null) ? con.getLineCount() : 0;
+        boolean following = mConsoleView.isFollowingTail();
+        if (lines == 0) {
+            mConsoleMeta.setText("hvc0");
+        } else if (!following) {
+            mConsoleMeta.setText("hvc0 · " + lines + " ln · Paused");
+        } else {
+            int kb = Math.max(1, con.getLength() / 1024);
+            mConsoleMeta.setText("hvc0 · " + lines + " ln · " + kb + " KB");
+        }
+        if (mBtnJumpBottom != null) {
+            mBtnJumpBottom.setVisibility((lines > 0 && !following) ? View.VISIBLE : View.GONE);
         }
     }
 }

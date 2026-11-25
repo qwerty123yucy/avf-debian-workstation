@@ -1,11 +1,11 @@
 [Unit]
-Description=AVF Host-Governed Dual-Stack Network Tunnel (vsock:2223)
+Description=AVF Host-Governed Dual-Stack Network & Power Control (vsock:2223/2224)
 After=local-fs.target systemd-udevd.service
 Before=network-online.target ssh.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/vmnet-guest -if vmnet0 -cidr 10.0.2.2/24 -cidr6 fd00:a7f::2/64 -dns 10.0.2.3 -dns2 10.0.2.4 -port 2223
+ExecStart=/usr/local/sbin/vmnet-guest -if vmnet0 -cidr 10.0.2.2/24 -cidr6 fd00:a7f::2/64 -dns 10.0.2.3 -dns2 10.0.2.4 -port 2223 -ctl-port 2224
 Restart=always
 RestartSec=1
 
