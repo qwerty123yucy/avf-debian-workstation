@@ -46,7 +46,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * graceful poweroff signaling, SSH TCP-to-vsock bridging, and per-session libvmnet.so
  * userspace networking.
  */
-final class VmSession implements VmController.SessionHandle {
+final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
     private static final String TAG = "AvfLinux";
     private static final int VMNET_VSOCK_PORT = 2223;
     private static final int POWER_VSOCK_PORT = 2224;
@@ -78,16 +78,14 @@ final class VmSession implements VmController.SessionHandle {
     private final AtomicBoolean mIntentionalStop = new AtomicBoolean(false);
     private final AtomicBoolean mPoweroffSent = new AtomicBoolean(false);
     private final AtomicBoolean mBridgesActivated = new AtomicBoolean(false);
+    private final AtomicBoolean mClosing = new AtomicBoolean(false);
     private final AtomicBoolean mClosed = new AtomicBoolean(false);
     private final Set<Closeable> mActiveSshRelays =
         Collections.newSetFromMap(new ConcurrentHashMap<Closeable, Boolean>());
 
     private volatile boolean mPoweroffAckOk = false;
+    private volatile VmStreamPump mStreamPump;
     private volatile OutputStream mConsoleIn;
-    private volatile InputStream mConsoleOut;
-    private volatile InputStream mLogOut;
-    private volatile Thread mConsoleThread;
-    private volatile Thread mLogThread;
     private volatile Thread mVmNetBridgeThread;
     private volatile ServerSocket mSshServer;
     private volatile Process mVmNetProc;
@@ -177,13 +175,57 @@ final class VmSession implements VmController.SessionHandle {
             }
         });
 
+        // Rebind any existing pipe pump before vm.run() so zero early U-Boot bytes can
+        // be routed to a previous session or dropped across restarts.
+        final VirtualMachine vmRef = vm;
+        VmStreamPump preboundPump = VmStreamPump.rebindIfPresent(vmRef, session);
         try {
-            vm.run();
-            session.startStreams();
+            vmRef.run();
+            VmStreamPump pump = (preboundPump != null)
+                ? preboundPump
+                : VmStreamPump.attachOrBind(
+                    vmRef,
+                    () -> openConsoleOutputQuietly(vmRef),
+                    () -> openLogOutputQuietly(vmRef),
+                    session);
+            pump.ensureStreamsStarted(
+                () -> openConsoleOutputQuietly(vmRef),
+                () -> openLogOutputQuietly(vmRef));
+            session.attachStreams(pump, openConsoleInputQuietly(vmRef));
             return session;
         } catch (Throwable t) {
+            if (preboundPump != null) {
+                preboundPump.detachImmediate(session);
+            }
             session.close(true);
             throw t;
+        }
+    }
+
+    private static InputStream openConsoleOutputQuietly(VirtualMachine vm) {
+        try {
+            return vm.getConsoleOutput();
+        } catch (Throwable t) {
+            Log.w(TAG, "getConsoleOutput failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    private static InputStream openLogOutputQuietly(VirtualMachine vm) {
+        try {
+            return vm.getLogOutput();
+        } catch (Throwable t) {
+            Log.w(TAG, "getLogOutput failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    private static OutputStream openConsoleInputQuietly(VirtualMachine vm) {
+        try {
+            return vm.getConsoleInput();
+        } catch (Throwable t) {
+            Log.w(TAG, "getConsoleInput failed: " + t.getMessage());
+            return null;
         }
     }
 
@@ -215,6 +257,23 @@ final class VmSession implements VmController.SessionHandle {
     }
 
     @Override public long id() { return mId; }
+    @Override public long sessionId() { return mId; }
+    @Override public boolean isClosed() { return mClosed.get(); }
+
+    @Override
+    public void onConsoleChars(char[] buf, int len) {
+        if (!mClosed.get()) {
+            mObserver.onConsoleChars(this, buf, len);
+        }
+    }
+
+    @Override
+    public void onVmLogLine(String line) {
+        if (!mClosed.get()) {
+            Log.i(TAG, "[vmlog] " + line);
+            mObserver.onVmLogLine(this, line);
+        }
+    }
     @Override public long generation() { return mGeneration; }
     @Override public int memMib() { return mMemMib; }
     @Override public int diskGb() { return mDiskGb; }
@@ -248,20 +307,20 @@ final class VmSession implements VmController.SessionHandle {
         return mStoppedLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
-    private void startStreams() {
-        if (mClosed.get()) return;
-        try {
-            mConsoleIn = mVm.getConsoleInput();
-        } catch (Throwable t) {
-            Log.w(TAG, "getConsoleInput failed: " + t.getMessage());
+    private void attachStreams(VmStreamPump pump, OutputStream consoleIn) {
+        if (mClosing.get()) {
+            if (pump != null) {
+                pump.detachImmediate(this);
+            }
+            return;
         }
-        startConsoleReader();
-        startLogReader();
+        mStreamPump = pump;
+        mConsoleIn = consoleIn;
     }
 
     @Override
     public void activateBridges() {
-        if (mClosed.get() || !mBridgesActivated.compareAndSet(false, true)) {
+        if (mClosing.get() || !mBridgesActivated.compareAndSet(false, true)) {
             return;
         }
         startSshBridge();
@@ -269,28 +328,16 @@ final class VmSession implements VmController.SessionHandle {
     }
 
     @Override
-    public void drainReaders(long timeoutMs) {
-        if (timeoutMs <= 0L) return;
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        Thread ct = mConsoleThread;
-        if (ct != null && ct != Thread.currentThread()) {
-            long wait = deadline - System.currentTimeMillis();
-            if (wait > 0L) {
-                try { ct.join(wait); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
-            }
-        }
-        Thread lt = mLogThread;
-        if (lt != null && lt != Thread.currentThread()) {
-            long wait = deadline - System.currentTimeMillis();
-            if (wait > 0L) {
-                try { lt.join(wait); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-            }
+    public void flushOutput(long timeoutMs) {
+        VmStreamPump pump = mStreamPump;
+        if (pump != null) {
+            pump.flushPending(this, timeoutMs);
         }
     }
 
     @Override
     public void writeConsoleInput(byte[] data) {
-        if (data == null || data.length == 0 || mClosed.get()) return;
+        if (data == null || data.length == 0 || mClosing.get()) return;
         OutputStream out = mConsoleIn;
         if (out == null) return;
         try {
@@ -324,7 +371,7 @@ final class VmSession implements VmController.SessionHandle {
 
     @Override
     public void close(boolean stopVmInstance) {
-        if (!mClosed.compareAndSet(false, true)) {
+        if (!mClosing.compareAndSet(false, true)) {
             return;
         }
         mConsoleIn = null;
@@ -349,16 +396,12 @@ final class VmSession implements VmController.SessionHandle {
             }
         }
 
-        InputStream conOut = mConsoleOut;
-        mConsoleOut = null;
-        if (conOut != null) {
-            try { conOut.close(); } catch (IOException ignored) {}
+        VmStreamPump pump = mStreamPump;
+        mStreamPump = null;
+        if (pump != null) {
+            pump.flushAndDetach(this, 25L);
         }
-        InputStream logOut = mLogOut;
-        mLogOut = null;
-        if (logOut != null) {
-            try { logOut.close(); } catch (IOException ignored) {}
-        }
+        mClosed.set(true);
 
         mStoppedLatch.countDown();
         mPowerAttemptDone.countDown();
@@ -402,63 +445,21 @@ final class VmSession implements VmController.SessionHandle {
         }
     }
 
-    private void startConsoleReader() {
-        Thread t = new Thread(() -> {
-            try {
-                InputStream raw = mVm.getConsoleOutput();
-                mConsoleOut = raw;
-                try (InputStreamReader reader = new InputStreamReader(raw, StandardCharsets.UTF_8)) {
-                    char[] cbuf = new char[4096];
-                    int n;
-                    while (!mClosed.get() && (n = reader.read(cbuf)) > 0) {
-                        if (mClosed.get()) break;
-                        mObserver.onConsoleChars(this, cbuf, n);
-                    }
-                }
-            } catch (Throwable e) {
-                Log.i(TAG, "Console stream ended (session=" + mId + "): " + e.getMessage());
-            }
-        }, "vm-console-" + mId);
-        t.setDaemon(true);
-        mConsoleThread = t;
-        t.start();
-    }
-
-    private void startLogReader() {
-        Thread t = new Thread(() -> {
-            try {
-                InputStream raw = mVm.getLogOutput();
-                mLogOut = raw;
-                try (BufferedReader br = new BufferedReader(new InputStreamReader(raw, StandardCharsets.UTF_8))) {
-                    String line;
-                    while (!mClosed.get() && (line = br.readLine()) != null) {
-                        if (mClosed.get()) break;
-                        Log.i(TAG, "[vmlog] " + line);
-                        mObserver.onVmLogLine(this, line);
-                    }
-                }
-            } catch (Throwable ignored) {}
-        }, "vm-log-" + mId);
-        t.setDaemon(true);
-        mLogThread = t;
-        t.start();
-    }
-
     private void startSshBridge() {
         try {
             final ServerSocket server = new ServerSocket();
             server.setReuseAddress(true);
             server.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), mSshLocalPort), 32);
-            if (mClosed.get()) {
+            if (mClosing.get()) {
                 server.close();
                 return;
             }
             mSshServer = server;
             Thread acceptThread = new Thread(() -> {
-                while (!mClosed.get() && !server.isClosed()) {
+                while (!mClosing.get() && !server.isClosed()) {
                     try {
                         final Socket sock = server.accept();
-                        if (mClosed.get()) {
+                        if (mClosing.get()) {
                             try { sock.close(); } catch (IOException ignored) {}
                             break;
                         }
@@ -495,7 +496,7 @@ final class VmSession implements VmController.SessionHandle {
                 }
             };
             mActiveSshRelays.add(relayHandle);
-            if (mClosed.get()) {
+            if (mClosing.get()) {
                 relayHandle.close();
                 return;
             }
@@ -582,7 +583,7 @@ final class VmSession implements VmController.SessionHandle {
                 "-dns-file", mDnsFile.getAbsolutePath());
             pb.redirectErrorStream(true);
             final Process proc = pb.start();
-            if (mClosed.get()) {
+            if (mClosing.get()) {
                 proc.destroy();
                 return;
             }
@@ -602,16 +603,16 @@ final class VmSession implements VmController.SessionHandle {
             logT.start();
 
             Thread bridgeT = new Thread(() -> {
-                for (int i = 0; i < 40 && !mClosed.get() && !mVmNetSockFile.exists(); i++) {
+                for (int i = 0; i < 40 && !mClosing.get() && !mVmNetSockFile.exists(); i++) {
                     try { Thread.sleep(100); } catch (InterruptedException e) { return; }
                 }
-                while (!mClosed.get()) {
+                while (!mClosing.get()) {
                     ParcelFileDescriptor vsock = null;
                     LocalSocket local = null;
                     boolean notifiedUp = false;
                     try {
                         vsock = mVm.connectVsock(VMNET_VSOCK_PORT);
-                        if (mClosed.get()) break;
+                        if (mClosing.get()) break;
 
                         local = new LocalSocket();
                         local.connect(new LocalSocketAddress(
@@ -627,14 +628,14 @@ final class VmSession implements VmController.SessionHandle {
                         try { vsock.close(); } catch (IOException ignored) {}
                         vsock = null;
 
-                        if (!mClosed.get()) {
+                        if (!mClosing.get()) {
                             notifiedUp = true;
                             mObserver.onVmNetStateChanged(this, true, "10.0.2.2");
                             Log.i(TAG, "vmnet vsock:2223 FD handed off to libvmnet.so (SCM_RIGHTS)");
                         }
 
                         InputStream lsIn = local.getInputStream();
-                        while (!mClosed.get() && lsIn.read() >= 0) {
+                        while (!mClosing.get() && lsIn.read() >= 0) {
                             // Wait until libvmnet.so closes control socket on tunnel EOF
                         }
                     } catch (Throwable ignored) {
@@ -642,11 +643,11 @@ final class VmSession implements VmController.SessionHandle {
                         mVmNetCtrlSock = null;
                         if (local != null) { try { local.close(); } catch (IOException ignored) {} }
                         if (vsock != null) { try { vsock.close(); } catch (IOException ignored) {} }
-                        if (notifiedUp && !mClosed.get()) {
+                        if (notifiedUp && !mClosing.get()) {
                             mObserver.onVmNetStateChanged(this, false, "");
                         }
                     }
-                    if (mClosed.get()) break;
+                    if (mClosing.get()) break;
                     try { Thread.sleep(1000); } catch (InterruptedException e) { break; }
                 }
             }, "vmnet-ctrl-" + mId);

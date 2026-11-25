@@ -66,7 +66,7 @@ public final class VmController {
         boolean isTerminated();
         boolean sendPoweroffOnce();
         boolean awaitStopped(long timeoutMs) throws InterruptedException;
-        void drainReaders(long timeoutMs);
+        void flushOutput(long timeoutMs);
         void writeConsoleInput(byte[] data);
         void close(boolean stopVmInstance);
     }
@@ -697,7 +697,7 @@ public final class VmController {
                         Thread.currentThread().interrupt();
                     }
                     if (clean) {
-                        session.drainReaders(150L);
+                        session.flushOutput(50L);
                         appendLog("[AVF Linux] Guest powered off cleanly.\n");
                         mHost.logInfo("Guest powered off cleanly (session=" + session.id() + ")");
                     } else {
@@ -709,7 +709,7 @@ public final class VmController {
                 }
             }
         } else {
-            session.drainReaders(150L);
+            session.flushOutput(50L);
             if (exitNotice != null && !exitNotice.isEmpty()) {
                 appendLog(exitNotice);
             }
