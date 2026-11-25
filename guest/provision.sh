@@ -6,21 +6,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TARGET_HOST="${1:-avf}"
 VMNET_BIN="${2:-$REPO_ROOT/build/vmnet-guest}"
+EFI_BIN="${3:-$REPO_ROOT/build/avf-fdt-edge.efi}"
 
 if [[ ! -f "$VMNET_BIN" ]]; then
     echo "Error: vmnet-guest binary not found at $VMNET_BIN" >&2
+    exit 1
+fi
+if [[ ! -f "$EFI_BIN" ]]; then
+    echo "Error: avf-fdt-edge.efi not found at $EFI_BIN (run ./guest/efi/build_efi.sh first)" >&2
     exit 1
 fi
 
 tar -C "$SCRIPT_DIR" -cf - etc usr | ssh "$TARGET_HOST" 'tar -C / -xf -'
 ssh "$TARGET_HOST" 'systemctl stop vmnet-guest.service 2>/dev/null || true'
 ssh "$TARGET_HOST" 'cat > /usr/local/sbin/vmnet-guest && chmod 755 /usr/local/sbin/vmnet-guest /usr/local/sbin/avf-boot-setup.sh /etc/grub.d/09_avf_dtb' < "$VMNET_BIN"
+ssh "$TARGET_HOST" 'cat > /boot/avf-fdt-edge.efi && chmod 644 /boot/avf-fdt-edge.efi && rm -f /boot/avf-gzvm-edge.dtb' < "$EFI_BIN"
 ssh "$TARGET_HOST" '
 set -eu
-if ! command -v fdtput >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends device-tree-compiler
-fi
 rm -f /etc/systemd/network/10-avf-dhcp.network
 /usr/local/sbin/avf-boot-setup.sh
 sysctl --system >/dev/null 2>&1 || true

@@ -30,7 +30,7 @@
 - **内存、CPU 与计时器**：宿主 4 GiB 按需分配 + 客户机 ~`2 GiB LZ4 zram0`（`vm.page-cluster=0` 避免无意义预读）；`CPU_TOPOLOGY_MATCH_HOST` 透传大小核拓扑；保留内核默认 `kernel.watchdog` 与 `vm.stat_interval`（实测在 MediaTek GenieZone 上禁用或拉长这两项会导致宿主 `crosvm` 空闲 CPU 反常暴涨约 35 倍）。
 - **数据完整性、优雅关机与防误操作**：支持从系统文件选择器直接导入下载目录中的 `.simg.gz` / `.simg`；导入前先校验文件头魔数，解包过程写入 `.tmp`、完整读至流末尾触发 GZIP CRC32 校验并 `fsync` 后再原子替换 `disk.img` 与 `seed.simg.gz`。客户机 `vmnet-guest` 监听仅限宿主（`CID=2`）访问的 `vsock:2224` 电源控制端口；宿主在点击 Stop/Restart、导入/重置前、移除最近任务卡片及收到系统关机广播时，先下发 `sync` + `systemctl poweroff` 等待客户机有序卸载文件系统（超时再回退强制停机），并保留上一轮会话的 `last-console.log` 与 `last-vmlog.log` 供排障读取。
 - **生命周期状态机与虚拟化终端**：宿主控制面采用单锁可形式化状态机（`VmController`）隔离物理阶段、目标意图与单次会话资源（`VmSession`），配合同进程 `LocalBinder`、不可变状态快照及与 `VirtualMachine` 底层管道同生命周期的单例流转发器（`VmStreamPump`，跨重启原子切换投递目标，避免非自有管道 FD 残留阻塞读线程或抢读下一轮引导首包）消除跨轮次竞态；内置控制台采用流式 VT100/ANSI 行环形缓冲（保留最近 2000 行 / 160 KB，折叠引导阶段冗余空行）与按视口虚拟化绘制的 `Canvas` 终端（流式刷新无重排开销，避免高速引导刷屏导致的空白或卡顿），软键盘采用 `BaseInputConnection` 增量差值发送。
-- **GenieZone 平台 PCI INTx 边沿触发设备树覆盖**：MediaTek GenieZone 平台未提供虚拟 GICv3 ITS（无 MSI-X），`virtio-pci` 外设回退使用独立共享外设中断（`SPI 36..41`）电平触发；同时宿主内核 `gzvm_irqfd` 虽向 `crosvm` 返回支持 `GZVM_IRQFD_FLAG_RESAMPLE`，实际并未接入 `resamplefd`，EL2 亦未在客户机 EOI 后重采样虚拟电平。当新完成事件落入客户机读取 `ISR` 清零至写 `ICC_EOIR1_EL1` 的窗口内时，`crosvm` 的 `interrupt_status` 会持续保持置位并抑制后续 `irqfd` 注入，导致块设备、`vsock` 或串口队列停滞。为此，`avf-boot-setup.service` 在检测到 `GICv3 Level virtio` 中断时，基于当前固件 `/sys/firmware/fdt` 剥离瞬态 `/chosen` 引导属性并将 `/pci/interrupt-map` 触发类型由 `0x4`（高电平）改为 `0x1`（上升沿），生成 `/boot/avf-gzvm-edge.dtb`，再由 `/etc/grub.d/09_avf_dtb` 在后续引导时通过 GRUB `devicetree` 加载（UEFI 内存映射仍由 U-Boot 实时提供，不修改标准 Debian 内核包；具备 GICv3 ITS/MSI-X 的 KVM 平台自动跳过）。
+- **GenieZone 平台启动期实时 FDT 边沿触发修补**：MediaTek GenieZone 平台未提供虚拟 GICv3 ITS（无 MSI-X），`virtio-pci` 外设回退使用独立共享外设中断（`SPI 36..41`）电平触发；同时宿主内核 `gzvm_irqfd` 虽向 `crosvm` 返回支持 `GZVM_IRQFD_FLAG_RESAMPLE`，实际并未接入 `resamplefd`，EL2 亦未在客户机 EOI 后重采样虚拟电平。当新完成事件落入客户机读取 `ISR` 清零至写 `ICC_EOIR1_EL1` 的窗口内时，`crosvm` 的 `interrupt_status` 会持续保持置位并抑制后续 `irqfd` 注入，导致块设备、`vsock` 或串口队列停滞。为此，`/etc/grub.d/09_avf_dtb` 在每次引导内核前通过 GRUB `chainloader` 调用无依赖 ARM64 UEFI 小程序 `/boot/avf-fdt-edge.efi`（源码见 `guest/efi/`），直接读取 U-Boot 当次提供的实时 `EFI_DTB_TABLE_GUID` 设备树：若检测到 `/intc` 存在 `arm,gic-v3-its` 或 `/pci` 存在 `msi-map`（如 KVM 平台）则一字节不改直接返回；否则按设备树 `#address-cells`/`#interrupt-cells` 动态计算步长，原地将 `/pci/interrupt-map` 中指向 GICv3 的 SPI 触发位由 `0x4`（高电平）改为 `0x1`（上升沿）后交回 GRUB 引导标准 Debian 内核。不缓存静态 DTB、不修改内核包，首次冷启动与系统 OTA 更新后均自动基于当次最新固件生效。
 - **实测基线**（MediaTek Dimensity 9400 / GenieZone / Android 16）：Debian 13 内核 + 用户态启动约 `4.7s`，`journalctl -b -p warning..emerg` 无告警，空闲时宿主 `crosvm` 占整机 CPU ~`0.25%`。
 
 ---
@@ -91,7 +91,7 @@
 - **Android 私人 DNS（DoT）与 `/etc/resolv.conf` 托管**：`vmnet-guest.service` 每次启动都会原子覆写客户机 `/etc/resolv.conf` 为固定虚拟 DNS（`10.0.2.3` / `10.0.2.4`），手动修改该文件会在重启服务或虚拟机后重置。客户机 DNS 查询由宿主 `libvmnet.so` 以 `com.avf.linux` 身份发往当前活跃网络 `LinkProperties` DNS 服务器的 53 端口；开启 VPN 时完整走 VPN 隧道，未开 VPN 时不经过系统级私人 DNS（DoT）。
 - **回环隔离与本地 OAuth 回调**：客户机 `127.0.0.1` 与 Android 宿主机隔离。若客户机内运行的 CLI 认证需要由手机浏览器回调 `http://localhost:<port>`（如部分 Google OAuth / `rclone` 流程），可在宿主机侧通过 `ssh -L <port>:127.0.0.1:<port> avf` 临时转发该端口完成授权。
 - **GenieZone 内存回收**：在 MediaTek GenieZone 平台下客户机内存页按需分配（上限 4 GiB），不会在运行时通过 balloon 自动回缩，停机或重启后释放。
-- **系统 OTA 更新**：部分厂商大版本 OTA 可能重置全局 `hidden_api_blacklist_exemptions`；若更新系统后无法启动 VM，重新执行该条 `settings put` 命令即可。若 GenieZone 平台大版本更新同时调整了宿主 `crosvm` 虚拟 PCI/MMIO 布局，删除客户机 `/boot/avf-gzvm-edge.dtb` 后重启一次即可按新固件设备树自动重建。
+- **系统 OTA 更新**：部分厂商大版本 OTA 可能重置全局 `hidden_api_blacklist_exemptions`；若更新系统后无法启动 VM，重新执行该条 `settings put` 命令即可。GenieZone PCI INTx 边沿触发改写已由 `/boot/avf-fdt-edge.efi` 在每次引导时原地作用于当次固件 FDT，OTA 变更虚拟 PCI/MMIO 布局后无需手工重建任何 DTB 文件。
 - **签名密钥与备份**：若自行编译安装，请妥善备份 `signing/avf-linux.jks`；丢失密钥将无法覆盖升级，卸载 App 会连带清除私有目录中的 `disk.img`。
 
 ---
@@ -102,18 +102,19 @@
 app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.7.3）
 app/compile-stubs/  编译期 AVF API 最小桩声明（不打包进 DEX）
 vmnet/              Go 源码：宿主 gVisor 双栈网关（libvmnet.so）与客户机隧道（vmnet-guest）
-guest/              客户机 systemd 单元、GRUB/fstab/sysctl/sshd 配置与 provision.sh
+guest/              客户机 systemd 单元、GRUB/fstab/sysctl/sshd 配置、UEFI FDT 修补器（guest/efi/）与 provision.sh
 scripts/            build_apk.py、make_golden_seed.py、avf-vm、avf-adb、setup-termux.sh
 ```
 
-构建前需准备 Go 1.24+、JDK（`javac`/`keytool`）及 Android SDK Build-Tools（设置 `ANDROID_HOME`）：
+构建前需准备 Go 1.24+、GCC/binutils（ARM64 宿主或交叉工具链）、JDK（`javac`/`keytool`）及 Android SDK Build-Tools（设置 `ANDROID_HOME`）：
 
 ```bash
-# 1. 编译宿主与客户机双端网络二进制
+# 1. 编译宿主与客户机双端网络二进制，以及启动期 UEFI FDT 边沿触发修补器
 cd vmnet
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o ../build/libvmnet.so ./cmd/vmnet-host
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o ../build/vmnet-guest ./cmd/vmnet-guest
 cd ..
+./guest/efi/build_efi.sh
 
 # 2. 编译、16 KB 对齐并签名 APK（可通过 AVF_KS_PASS 指定密钥库口令）
 python3 scripts/build_apk.py

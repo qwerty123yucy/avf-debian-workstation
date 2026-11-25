@@ -6,10 +6,12 @@ exec_prefix="/usr"
 datarootdir="/usr/share"
 . "$datarootdir/grub/grub-mkconfig_lib"
 
-echo "insmod fdt"
+echo "insmod chain"
 prepare_grub_to_access_device "${GRUB_DEVICE_BOOT}"
 cat << 'EOF'
-if [ -f /boot/avf-gzvm-edge.dtb ]; then
-    devicetree /boot/avf-gzvm-edge.dtb
+if [ -f /boot/avf-fdt-edge.efi ]; then
+    if chainloader /boot/avf-fdt-edge.efi; then
+        boot
+    fi
 fi
 EOF
