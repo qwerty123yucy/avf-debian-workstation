@@ -173,17 +173,20 @@ final class VmStreamPump {
     void flushAndDetach(Sink expected, long timeoutMs) {
         if (expected == null) return;
         flushPending(expected, timeoutMs);
+        String tail = null;
         synchronized (mStateLock) {
             if (mTarget.get() == expected) {
                 if (mLogLineSid == expected.sessionId() && mLogLineBuf.size() > 0 && !expected.isClosed()) {
-                    String tail = new String(mLogLineBuf.toByteArray(), StandardCharsets.UTF_8);
+                    tail = new String(mLogLineBuf.toByteArray(), StandardCharsets.UTF_8);
                     mLogLineBuf.reset();
-                    try {
-                        expected.onVmLogLine(tail);
-                    } catch (Throwable ignored) {}
                 }
                 mTarget.compareAndSet(expected, null);
             }
+        }
+        if (tail != null && !expected.isClosed()) {
+            try {
+                expected.onVmLogLine(tail);
+            } catch (Throwable ignored) {}
         }
     }
 
@@ -260,9 +263,11 @@ final class VmStreamPump {
             }
         } catch (Throwable ignored) {
         } finally {
-            mConAlive.set(false);
             synchronized (mStateLock) {
-                if (mConIn == in) mConBusy = false;
+                if (mConIn == in) {
+                    mConAlive.set(false);
+                    mConBusy = false;
+                }
                 mStateLock.notifyAll();
             }
         }
@@ -324,9 +329,11 @@ final class VmStreamPump {
             }
         } catch (Throwable ignored) {
         } finally {
-            mLogAlive.set(false);
             synchronized (mStateLock) {
-                if (mLogIn == in) mLogBusy = false;
+                if (mLogIn == in) {
+                    mLogAlive.set(false);
+                    mLogBusy = false;
+                }
                 mStateLock.notifyAll();
             }
         }
