@@ -157,7 +157,10 @@ func listenVsock(port uint32) (int, error) {
 	return fd, nil
 }
 
-func acceptVsock(lfd int) (int, uint32, error) {
+// acceptVsock accepts the next connection and rejects any peer other than the host
+// (CID 2): both listeners here are host-only, so guest-local vsock loopback clients
+// must not reach the packet tunnel or power control.
+func acceptVsock(lfd int) (int, error) {
 	var sa rawSockaddrVM
 	saLen := uint32(unsafe.Sizeof(sa))
 	nfd, _, errno := syscall.Syscall(
@@ -167,12 +170,16 @@ func acceptVsock(lfd int) (int, uint32, error) {
 		uintptr(unsafe.Pointer(&saLen)),
 	)
 	if errno != 0 {
-		return -1, 0, errno
+		return -1, errno
 	}
 	fd := int(nfd)
+	if sa.CID != vmaddrCidHost {
+		_ = syscall.Close(fd)
+		return -1, fmt.Errorf("rejected non-host peer CID=%d", sa.CID)
+	}
 	syscall.CloseOnExec(fd)
 	_ = syscall.SetNonblock(fd, true)
-	return fd, sa.CID, nil
+	return fd, nil
 }
 
 func handlePowerConn(cf *os.File, port uint32, actionPending *atomic.Bool) {
@@ -228,18 +235,13 @@ func servePowerControl(port uint32) {
 	sem := make(chan struct{}, 4)
 
 	for {
-		cfd, peerCID, err := acceptVsock(lfd)
+		cfd, err := acceptVsock(lfd)
 		if err != nil {
 			log.Printf("power control accept error: %v", err)
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
 		cf := os.NewFile(uintptr(cfd), "vsock-ctl")
-		if peerCID != vmaddrCidHost {
-			log.Printf("power control rejected non-host CID=%d", peerCID)
-			_ = cf.Close()
-			continue
-		}
 		select {
 		case sem <- struct{}{}:
 			go func(f *os.File) {
@@ -339,7 +341,7 @@ func main() {
 
 	// Accept loop for host connections
 	for {
-		cfd, _, err := acceptVsock(lfd)
+		cfd, err := acceptVsock(lfd)
 		if err != nil {
 			log.Printf("accept error: %v", err)
 			continue

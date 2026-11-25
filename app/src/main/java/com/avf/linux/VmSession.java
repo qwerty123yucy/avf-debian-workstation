@@ -37,6 +37,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Cohesive runtime unit for a single VM boot session.
@@ -80,6 +81,7 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
     private final AtomicBoolean mBridgesActivated = new AtomicBoolean(false);
     private final AtomicBoolean mClosing = new AtomicBoolean(false);
     private final AtomicBoolean mClosed = new AtomicBoolean(false);
+    private final AtomicReference<VmController.SessionExit> mExit = new AtomicReference<>();
     private final Set<Closeable> mActiveSshRelays =
         Collections.newSetFromMap(new ConcurrentHashMap<Closeable, Boolean>());
 
@@ -293,8 +295,14 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
     }
 
     @Override
-    public void notifyVmTerminated() {
+    public void recordExit(VmController.SessionExit exit) {
+        mExit.compareAndSet(null, exit);
         mStoppedLatch.countDown();
+    }
+
+    @Override
+    public VmController.SessionExit exit() {
+        return mExit.get();
     }
 
     @Override

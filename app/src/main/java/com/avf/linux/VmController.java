@@ -62,13 +62,40 @@ public final class VmController {
         String startupBanner();
         void activateBridges();
         void markIntentionalStop();
-        void notifyVmTerminated();
+        /** Records the first terminal event of this VM run and wakes awaitStopped(). */
+        void recordExit(SessionExit exit);
+        /** The recorded terminal event, or null while the VM is still running. */
+        SessionExit exit();
         boolean isTerminated();
         boolean sendPoweroffOnce();
         boolean awaitStopped(long timeoutMs) throws InterruptedException;
         void flushOutput(long timeoutMs);
         void writeConsoleInput(byte[] data);
         void close(boolean stopVmInstance);
+    }
+
+    /**
+     * Terminal event of one VM run. Stored on its session (first event wins) so that an exit
+     * arriving before the boot effect installs the session is replayed rather than lost.
+     */
+    public static final class SessionExit {
+        final boolean rebootRequested;
+        final int reasonCode;
+        final String error;
+
+        private SessionExit(boolean rebootRequested, int reasonCode, String error) {
+            this.rebootRequested = rebootRequested;
+            this.reasonCode = reasonCode;
+            this.error = error;
+        }
+
+        public static SessionExit stopped(boolean rebootRequested, int reasonCode) {
+            return new SessionExit(rebootRequested, reasonCode, null);
+        }
+
+        public static SessionExit failed(int errorCode, String message) {
+            return new SessionExit(false, errorCode, "VM error (" + errorCode + "): " + message);
+        }
     }
 
     public interface MaintenanceJob {
@@ -579,47 +606,50 @@ public final class VmController {
     // -------------------------------------------------------------------------
 
     public void onSessionStopped(SessionHandle session, boolean guestRebootRequested, int reasonCode) {
-        if (session == null) return;
-        session.notifyVmTerminated();
+        onSessionExit(session, SessionExit.stopped(guestRebootRequested, reasonCode));
+    }
 
-        Transition tr = null;
+    public void onSessionError(SessionHandle session, int errorCode, String message) {
+        onSessionExit(session, SessionExit.failed(errorCode, message));
+    }
+
+    private void onSessionExit(SessionHandle session, SessionExit exit) {
+        if (session == null) return;
+        // Record before taking mLock: if the boot effect has not installed this session yet,
+        // it replays the recorded exit when it does (runBootEffect).
+        session.recordExit(exit);
+
+        Transition tr;
         synchronized (mLock) {
-            // If Phase != RUNNING (e.g. already STOPPING), notifyVmTerminated() already woke Effect.Stop
+            // Outside RUNNING, recordExit() has already woken Effect.Stop
             if (mPhase != VmStatus.State.RUNNING || mSession != session) {
                 return;
             }
-            boolean shouldReboot = guestRebootRequested && (mLifecycle == Lifecycle.RESIDENT);
-            if (shouldReboot) {
-                mTarget = Target.RUN;
-                mDesiredGen++;
-            } else {
-                mTarget = Target.IDLE;
-            }
-            mPendingExitNotice = "[AVF Linux] VM stopped (reason=" + reasonCode
-                + (shouldReboot ? ", rebooting..." : "") + ")\n";
+            applyExitLocked(session.exit());
             tr = new Transition();
             reconcileLocked(tr, false);
         }
         executeTransition(tr);
     }
 
-    public void onSessionError(SessionHandle session, int errorCode, String message) {
-        if (session == null) return;
-        session.notifyVmTerminated();
-
-        Transition tr = null;
-        synchronized (mLock) {
-            if (mPhase != VmStatus.State.RUNNING || mSession != session) {
-                return;
-            }
-            String err = "VM error (" + errorCode + "): " + message;
+    /** Retargets after a session exit; the next reconcileLocked() then applies Rule R1. */
+    private void applyExitLocked(SessionExit exit) {
+        boolean reboot = exit.error == null
+            && exit.rebootRequested
+            && mTarget == Target.RUN
+            && mLifecycle == Lifecycle.RESIDENT;
+        if (reboot) {
+            mDesiredGen++;
+        } else {
             mTarget = Target.IDLE;
-            mPendingAsyncError = err;
-            mPendingExitNotice = "[AVF Linux] " + err + "\n";
-            tr = new Transition();
-            reconcileLocked(tr, false);
         }
-        executeTransition(tr);
+        if (exit.error != null) {
+            mPendingAsyncError = exit.error;
+            mPendingExitNotice = "[AVF Linux] " + exit.error + "\n";
+        } else {
+            mPendingExitNotice = "[AVF Linux] VM stopped (reason=" + exit.reasonCode
+                + (reboot ? ", rebooting..." : "") + ")\n";
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -651,8 +681,16 @@ public final class VmController {
                 mStartedAtMs = System.currentTimeMillis();
                 mPhase = VmStatus.State.RUNNING;
 
-                // Reconcile immediately: if Target changed during boot, Rule R1 transitions
-                // straight into STOPPING without ever exposing RUNNING or starting bridges.
+                // The VM may have exited before this install, when its callback found no
+                // RUNNING session to act on; replay that exit here.
+                SessionExit early = booted.exit();
+                if (early != null) {
+                    applyExitLocked(early);
+                }
+
+                // Reconcile immediately: if Target changed during boot (or the VM already
+                // exited), Rule R1 transitions straight into STOPPING without ever exposing
+                // RUNNING or starting bridges.
                 reconcileLocked(tr, true);
                 if (mPhase == VmStatus.State.RUNNING && mSession == booted) {
                     tr.activateBridgesSession = booted;
