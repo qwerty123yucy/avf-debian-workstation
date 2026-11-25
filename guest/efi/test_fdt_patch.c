@@ -269,6 +269,18 @@ static void test_malformed_inputs(void) {
     wr_be32(bad + 20, 17U);
     wr_be32(bad + 24, 16U);
     CHECK(avf_fdt_patch_pci_edge(bad, &count) == AVF_FDT_INVALID, "out-of-bounds offset rejected safely");
+
+    /* FDT v16 header (lacks size_dt_struct at offset 36) must be rejected */
+    memset(bad, 0, sizeof(bad));
+    wr_be32(bad + 0, 0xd00dfeedU);
+    wr_be32(bad + 4, 64U);
+    wr_be32(bad + 8, 40U);
+    wr_be32(bad + 12, 48U);
+    wr_be32(bad + 20, 16U);
+    wr_be32(bad + 24, 16U);
+    wr_be32(bad + 32, 8U);
+    wr_be32(bad + 36, 8U);
+    CHECK(avf_fdt_patch_pci_edge(bad, &count) == AVF_FDT_INVALID, "FDT v16 header without size_dt_struct rejected");
 }
 
 static void test_live_fdt_copy(const char *path) {
@@ -280,6 +292,11 @@ static void test_live_fdt_copy(const char *path) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        failures++;
+        return;
+    }
     uint8_t *blob = (uint8_t *)malloc((size_t)sz);
     uint8_t *orig = (uint8_t *)malloc((size_t)sz);
     if (!blob || !orig || fread(blob, 1, (size_t)sz, f) != (size_t)sz) {
@@ -292,37 +309,65 @@ static void test_live_fdt_copy(const char *path) {
     fclose(f);
     memcpy(orig, blob, (size_t)sz);
 
-    /* Revert any existing edge flags (1) back to GenieZone raw level flags (4) in the copy
-       if booted with old edge DTB, by scanning for our known 10-cell crosvm SPI entries. */
-    uint32_t off_st  = rd_be32(blob + 8);
-    uint32_t off_str = rd_be32(blob + 12);
-    uint32_t sz_st   = rd_be32(blob + 36);
-    uint8_t *p = blob + off_st, *end = p + sz_st;
-    int reverted = 0;
-    while (p + 4 <= end) {
-        uint32_t tok = rd_be32(p); p += 4;
-        if (tok == 1U) { while (*p) p++; p++; while (((uintptr_t)(p - blob) & 3U)) p++; }
-        else if (tok == 3U) {
-            uint32_t len = rd_be32(p), noff = rd_be32(p + 4); p += 8;
-            if (strcmp((const char *)(blob + off_str + noff), "interrupt-map") == 0 && (len % 40U) == 0) {
-                for (uint32_t i = 0; i < len; i += 40U) {
-                    if (rd_be32(p + i + 36) == 1U) {
-                        wr_be32(p + i + 36, 4U);
-                        reverted++;
-                    }
-                }
-            }
-            p += (len + 3U) & ~3U;
-        } else if (tok == 9U) break;
-    }
-
     uint32_t count = 0;
     int rc = avf_fdt_patch_pci_edge(blob, &count);
-    CHECK(rc == AVF_FDT_PATCHED && count == (uint32_t)(reverted > 0 ? reverted : 7),
-          "live /sys/firmware/fdt copy patches all PCI INTx entries cleanly");
-    if (reverted > 0) {
-        CHECK(memcmp(blob, orig, (size_t)sz) == 0,
-              "patched copy matches live edge-triggered FDT byte-for-byte");
+    if (rc == AVF_FDT_SKIP_HAS_ITS) {
+        CHECK(count == 0 && memcmp(blob, orig, (size_t)sz) == 0,
+              "live /sys/firmware/fdt with ITS/MSI skipped untouched");
+    } else if (rc == AVF_FDT_INVALID) {
+        CHECK(count == 0 && memcmp(blob, orig, (size_t)sz) == 0,
+              "live /sys/firmware/fdt without top-level GICv3+PCI left untouched");
+    } else if (rc == AVF_FDT_PATCHED) {
+        uint32_t count2 = 0;
+        CHECK(count > 0, "live unpatched /sys/firmware/fdt patched PCI INTx entries");
+        CHECK(avf_fdt_patch_pci_edge(blob, &count2) == AVF_FDT_NO_CHANGE && count2 == 0,
+              "live FDT second pass is idempotent");
+    } else if (rc == AVF_FDT_NO_CHANGE && (size_t)sz >= 40U) {
+        /* Already edge-triggered in RAM: revert 10-cell crosvm SPI entries (1 -> 4) and re-patch */
+        uint32_t off_st  = rd_be32(blob + 8);
+        uint32_t off_str = rd_be32(blob + 12);
+        uint32_t sz_str  = rd_be32(blob + 32);
+        uint32_t sz_st   = rd_be32(blob + 36);
+        int reverted = 0;
+        if (off_st <= (uint32_t)sz && sz_st <= (uint32_t)sz - off_st
+                && off_str <= (uint32_t)sz && sz_str <= (uint32_t)sz - off_str) {
+            uint8_t *p = blob + off_st, *end = p + sz_st;
+            while (p + 4 <= end) {
+                uint32_t tok = rd_be32(p); p += 4;
+                if (tok == 1U) {
+                    while (p < end && *p) p++;
+                    if (p >= end) break;
+                    p++;
+                    while (p < end && ((uintptr_t)(p - blob) & 3U)) p++;
+                } else if (tok == 3U && p + 8 <= end) {
+                    uint32_t len = rd_be32(p), noff = rd_be32(p + 4); p += 8;
+                    if (len > (uint32_t)(end - p)) break;
+                    if (noff < sz_str
+                            && strcmp((const char *)(blob + off_str + noff), "interrupt-map") == 0
+                            && (len % 40U) == 0) {
+                        for (uint32_t i = 0; i < len; i += 40U) {
+                            if (rd_be32(p + i + 28) == 0U && rd_be32(p + i + 36) == 1U) {
+                                wr_be32(p + i + 36, 4U);
+                                reverted++;
+                            }
+                        }
+                    }
+                    p += (len + 3U) & ~3U;
+                } else if (tok == 9U) {
+                    break;
+                }
+            }
+        }
+        if (reverted > 0) {
+            rc = avf_fdt_patch_pci_edge(blob, &count);
+            CHECK(rc == AVF_FDT_PATCHED && count == (uint32_t)reverted,
+                  "live /sys/firmware/fdt copy patches all PCI INTx entries cleanly");
+            CHECK(memcmp(blob, orig, (size_t)sz) == 0,
+                  "patched copy matches live edge-triggered FDT byte-for-byte");
+        } else {
+            CHECK(memcmp(blob, orig, (size_t)sz) == 0,
+                  "live /sys/firmware/fdt with no matching level SPIs left untouched");
+        }
     }
 
     free(blob);

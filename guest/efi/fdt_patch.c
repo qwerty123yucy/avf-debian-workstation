@@ -109,7 +109,7 @@ int avf_fdt_patch_pci_edge(void *fdt, uint32_t *patched_count_out) {
     if (totalsize < FDT_HDR_SIZE || totalsize > FDT_MAX_TOTALSIZE) {
         return AVF_FDT_INVALID;
     }
-    if (version < 16U || last_comp_ver > 17U) {
+    if (version < 17U || last_comp_ver > 17U) {
         return AVF_FDT_INVALID;
     }
     if (off_dt_struct < FDT_HDR_SIZE || (off_dt_struct & 3U) != 0U) {

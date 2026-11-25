@@ -157,6 +157,8 @@ func listenVsock(port uint32) (int, error) {
 	return fd, nil
 }
 
+var errNonHostPeer = errors.New("rejected non-host peer")
+
 // acceptVsock accepts the next connection and rejects any peer other than the host
 // (CID 2): both listeners here are host-only, so guest-local vsock loopback clients
 // must not reach the packet tunnel or power control.
@@ -175,7 +177,7 @@ func acceptVsock(lfd int) (int, error) {
 	fd := int(nfd)
 	if sa.CID != vmaddrCidHost {
 		_ = syscall.Close(fd)
-		return -1, fmt.Errorf("rejected non-host peer CID=%d", sa.CID)
+		return -1, fmt.Errorf("%w CID=%d", errNonHostPeer, sa.CID)
 	}
 	syscall.CloseOnExec(fd)
 	_ = syscall.SetNonblock(fd, true)
@@ -238,7 +240,9 @@ func servePowerControl(port uint32) {
 		cfd, err := acceptVsock(lfd)
 		if err != nil {
 			log.Printf("power control accept error: %v", err)
-			time.Sleep(200 * time.Millisecond)
+			if !errors.Is(err, errNonHostPeer) {
+				time.Sleep(200 * time.Millisecond)
+			}
 			continue
 		}
 		cf := os.NewFile(uintptr(cfd), "vsock-ctl")
@@ -344,6 +348,9 @@ func main() {
 		cfd, err := acceptVsock(lfd)
 		if err != nil {
 			log.Printf("accept error: %v", err)
+			if !errors.Is(err, errNonHostPeer) {
+				time.Sleep(200 * time.Millisecond)
+			}
 			continue
 		}
 		cf := os.NewFile(uintptr(cfd), "vsock-conn")

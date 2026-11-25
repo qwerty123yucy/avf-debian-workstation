@@ -15,3 +15,7 @@ if ! swapon --show | grep -q zram0; then
         swapon -p 100 /dev/zram0 2>/dev/null || true
     fi
 fi
+if grep -qE 'GICv3.*Level.*virtio' /proc/interrupts 2>/dev/null; then
+    msg="avf-boot-setup: virtio PCI IRQs are still GICv3 Level-triggered (check /boot/avf-fdt-edge.efi and GRUB 09_avf_dtb)"
+    echo "<4>$msg" > /dev/kmsg 2>/dev/null || echo "$msg" >&2
+fi

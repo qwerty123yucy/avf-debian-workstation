@@ -7,17 +7,19 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUT_DIR="${1:-$REPO_ROOT/build}"
 OUT_EFI="$OUT_DIR/avf-fdt-edge.efi"
 
-CC="${CC:-gcc}"
-LD="${LD:-ld}"
-OBJCOPY="${OBJCOPY:-objcopy}"
-READELF="${READELF:-readelf}"
+HOST_CC="${HOST_CC:-cc}"
+CROSS_COMPILE="${CROSS_COMPILE:-}"
+CC="${CC:-${CROSS_COMPILE}gcc}"
+LD="${LD:-${CROSS_COMPILE}ld}"
+OBJCOPY="${OBJCOPY:-${CROSS_COMPILE}objcopy}"
+READELF="${READELF:-${CROSS_COMPILE}readelf}"
 
 mkdir -p "$OUT_DIR"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 # 1. Run host unit tests on fdt_patch.c (plus live /sys/firmware/fdt copy when available)
-"$CC" -std=c99 -O2 -Wall -Wextra -Werror \
+"$HOST_CC" -std=c99 -O2 -Wall -Wextra -Werror \
     "$SCRIPT_DIR/fdt_patch.c" "$SCRIPT_DIR/test_fdt_patch.c" \
     -o "$TMP_DIR/test_fdt_patch"
 if [[ -r /sys/firmware/fdt ]]; then
@@ -29,7 +31,7 @@ fi
 # 2. Compile freestanding PC-relative AArch64 objects (zero libc, zero globals)
 CFLAGS=(
     -std=c99 -O2 -Wall -Wextra -Werror
-    -ffreestanding -fPIE -fvisibility=hidden
+    -ffreestanding -fPIE -fvisibility=hidden -ffixed-x18
     -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables
     -fno-ident -fno-common -mgeneral-regs-only -mno-outline-atomics
 )
@@ -84,9 +86,9 @@ assert ep == 0x1000 and code_base == 0x1000, f"unexpected ep={ep:#x}"
 assert sec_align == 0x1000 and file_align == 0x1000
 assert hdr_sz == 0x1000 and subsys == 10 and ndir == 16
 assert img_sz == len(data), f"SizeOfImage {img_sz:#x} != file size {len(data):#x}"
-assert reloc_sz == 10 and reloc_rva + 10 <= len(data)
-page_rva, blk_sz, entry = struct.unpack_from("<IIH", data, reloc_rva)
-assert page_rva == 0 and blk_sz == 10 and entry == 0
+assert reloc_sz == 12 and reloc_rva + 12 <= len(data)
+page_rva, blk_sz, entry0, entry1 = struct.unpack_from("<IIHH", data, reloc_rva)
+assert page_rva == 0 and blk_sz == 12 and entry0 == 0 and entry1 == 0
 
 sec_off = opt + opt_sz
 for i, want_name in enumerate((b".text\x00\x00\x00", b".reloc\x00\x00")):

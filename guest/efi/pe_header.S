@@ -65,7 +65,7 @@ optional_hdr:
     .quad   0                           /* 3: Exception Table */
     .quad   0                           /* 4: Certificate Table */
     .long   _reloc_start - _pe_header   /* 5: Base Relocation Table RVA */
-    .long   10                          /* 5: Base Relocation Table Size */
+    .long   12                          /* 5: Base Relocation Table Size */
     .quad   0                           /* 6: Debug */
     .quad   0                           /* 7: Architecture */
     .quad   0                           /* 8: Global Ptr */
@@ -92,7 +92,7 @@ section_table:
 
     /* Section 1: .reloc */
     .ascii  ".reloc\0\0"
-    .long   10                          /* VirtualSize */
+    .long   12                          /* VirtualSize */
     .long   _reloc_start - _pe_header   /* VirtualAddress */
     .long   _reloc_raw_size             /* SizeOfRawData */
     .long   _reloc_start - _pe_header   /* PointerToRawData */
@@ -102,8 +102,9 @@ section_table:
     .short  0                           /* NumberOfLinenumbers */
     .long   0x42000040                  /* CNT_INITIALIZED_DATA | MEM_DISCARDABLE | MEM_READ */
 
-    /* Minimal valid no-op base relocation block (IMAGE_REL_BASED_ABSOLUTE) */
+    /* Minimal valid no-op base relocation block (IMAGE_REL_BASED_ABSOLUTE, 32-bit aligned) */
     .section .reloc_data, "a"
     .long   0                           /* PageRVA */
-    .long   10                          /* BlockSize (8-byte header + 1 entry) */
+    .long   12                          /* BlockSize (8-byte header + 2 entries) */
     .short  0                           /* Type=0 (ABSOLUTE/no-op), Offset=0 */
+    .short  0                           /* Padding entry for 32-bit block alignment */

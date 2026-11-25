@@ -11,7 +11,7 @@ enum avf_fdt_result {
 };
 
 /*
- * In-place patch of a live Flattened Device Tree (FDT v16/v17):
+ * In-place patch of a live Flattened Device Tree (FDT v17+):
  * On GICv3 platforms without ITS/MSI-X (e.g., MediaTek GenieZone), switches
  * /pci/interrupt-map SPI trigger flags from IRQ_TYPE_LEVEL_HIGH (4) to
  * IRQ_TYPE_EDGE_RISING (1) without resizing or relocating the FDT.
