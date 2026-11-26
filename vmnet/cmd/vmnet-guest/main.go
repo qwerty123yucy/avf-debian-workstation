@@ -334,9 +334,14 @@ func main() {
 					wErr = bw.Flush()
 				}
 				if wErr != nil {
-					_ = active.Close()
+					bad := active
 					active = nil
 					bw = nil
+					connMu.Unlock()
+					if bad != nil {
+						_ = bad.Close()
+					}
+					continue
 				}
 			}
 			connMu.Unlock()
@@ -357,12 +362,13 @@ func main() {
 		log.Printf("Host vmnet connected")
 
 		connMu.Lock()
-		if active != nil {
-			_ = active.Close()
-		}
+		prev := active
 		active = cf
 		bw = bufio.NewWriterSize(cf, 131072)
 		connMu.Unlock()
+		if prev != nil {
+			_ = prev.Close()
+		}
 
 		// VSOCK -> TUN loop
 		br := bufio.NewReaderSize(cf, 131072)
@@ -382,13 +388,15 @@ func main() {
 			_, _ = tun.Write(pkt[:plen])
 		}
 
+		// Close cf before taking connMu so a TUN->VSOCK flush blocked on a full vsock
+		// ring wakes immediately instead of deadlocking with connMu acquisition.
+		_ = cf.Close()
 		connMu.Lock()
 		if active == cf {
 			active = nil
 			bw = nil
 		}
 		connMu.Unlock()
-		_ = cf.Close()
 		log.Printf("Host vmnet disconnected")
 	}
 }

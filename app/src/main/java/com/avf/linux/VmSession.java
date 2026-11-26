@@ -34,6 +34,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -51,6 +52,7 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
     private static final String TAG = "AvfLinux";
     private static final int VMNET_VSOCK_PORT = 2223;
     private static final int POWER_VSOCK_PORT = 2224;
+    private static final int MAX_SSH_RELAYS = 64;
 
     interface Observer {
         void onConsoleChars(VmSession session, char[] buf, int len);
@@ -82,6 +84,7 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
     private final AtomicBoolean mClosing = new AtomicBoolean(false);
     private final AtomicBoolean mClosed = new AtomicBoolean(false);
     private final AtomicReference<VmController.SessionExit> mExit = new AtomicReference<>();
+    private final Semaphore mSshRelaySem = new Semaphore(MAX_SSH_RELAYS);
     private final Set<Closeable> mActiveSshRelays =
         Collections.newSetFromMap(new ConcurrentHashMap<Closeable, Boolean>());
 
@@ -467,13 +470,19 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
                 while (!mClosing.get() && !server.isClosed()) {
                     try {
                         final Socket sock = server.accept();
-                        if (mClosing.get()) {
+                        if (mClosing.get() || !mSshRelaySem.tryAcquire()) {
                             try { sock.close(); } catch (IOException ignored) {}
-                            break;
+                            if (mClosing.get()) break;
+                            continue;
                         }
-                        Thread ct = new Thread(() -> relayTcpToVsock(sock), "ssh-relay-" + mId);
-                        ct.setDaemon(true);
-                        ct.start();
+                        try {
+                            Thread ct = new Thread(() -> relayTcpToVsock(sock), "ssh-relay-" + mId);
+                            ct.setDaemon(true);
+                            ct.start();
+                        } catch (Throwable t) {
+                            mSshRelaySem.release();
+                            try { sock.close(); } catch (IOException ignored) {}
+                        }
                     } catch (IOException e) {
                         break;
                     }
@@ -488,6 +497,12 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
     }
 
     private void relayTcpToVsock(final Socket sock) {
+        final AtomicBoolean permitReleased = new AtomicBoolean(false);
+        final Runnable releasePermit = () -> {
+            if (permitReleased.compareAndSet(false, true)) {
+                mSshRelaySem.release();
+            }
+        };
         ParcelFileDescriptor vsock = null;
         Closeable relayHandle = null;
         try {
@@ -505,7 +520,9 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
             };
             mActiveSshRelays.add(relayHandle);
             if (mClosing.get()) {
+                mActiveSshRelays.remove(relayHandle);
                 relayHandle.close();
+                releasePermit.run();
                 return;
             }
 
@@ -519,6 +536,7 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
                 if (rem.decrementAndGet() == 0) {
                     mActiveSshRelays.remove(finalHandle);
                     try { finalHandle.close(); } catch (IOException ignored) {}
+                    releasePermit.run();
                 }
             };
 
@@ -571,6 +589,7 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
                     try { vsock.close(); } catch (IOException ignored) {}
                 }
             }
+            releasePermit.run();
         }
     }
 

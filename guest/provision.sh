@@ -25,18 +25,21 @@ ssh "$TARGET_HOST" '
 set -eu
 rm -f /etc/systemd/network/10-avf-dhcp.network
 purge=""
-for pkg in cloud-init cloud-initramfs-growroot; do
+for pkg in cloud-init cloud-initramfs-growroot unattended-upgrades; do
     if dpkg -s "$pkg" >/dev/null 2>&1; then purge="$purge $pkg"; fi
 done
 if [ -n "$purge" ]; then
+    systemctl stop unattended-upgrades.service 2>/dev/null || true
     DEBIAN_FRONTEND=noninteractive apt-get purge -y $purge
 fi
-rm -rf /etc/cloud /var/lib/cloud
+rm -rf /etc/cloud /var/lib/cloud /var/log/unattended-upgrades
 /usr/local/sbin/avf-boot-setup.sh
 sysctl --system >/dev/null 2>&1 || true
 systemctl daemon-reload
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer e2scrub_all.timer 2>/dev/null || true
 systemctl enable vmnet-guest.service sshd-vsock.socket avf-boot-setup.service fstrim.timer
 systemctl start sshd-vsock.socket
+systemctl reload ssh.service 2>/dev/null || true
 systemctl restart vmnet-guest.service
 update-initramfs -u
 update-grub

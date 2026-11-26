@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,7 +39,12 @@ const (
 	gwVirtIP                = "10.0.2.1"
 	gwVirtIPv6              = "fd00:a7f::1"
 	maxBatch                = 64
-	maxUDPFlows             = 512
+	maxUDPFlows             = 2048
+	udpBufSize              = 65535
+	dnsBufSize              = 4096
+	udpIdleTimeout          = 45 * time.Second
+	dnsInitIdleTimeout      = 5 * time.Second
+	dnsPostReplyIdleTimeout = 1500 * time.Millisecond
 )
 
 var (
@@ -234,18 +240,26 @@ func relayUDP(guest *gonet.UDPConn, dst string, isDNS bool) {
 		return
 	}
 	defer hostConn.Close()
+	relayUDPConn(guest, hostConn, isDNS)
+}
 
-	idleTimeout := 45 * time.Second
+func relayUDPConn(guest net.Conn, hostConn net.Conn, isDNS bool) {
+
+	bufSz := udpBufSize
+	initIdle := udpIdleTimeout
 	if isDNS {
-		idleTimeout = 5 * time.Second
+		bufSz = dnsBufSize
+		initIdle = dnsInitIdleTimeout
 	}
+	var idleNs atomic.Int64
+	idleNs.Store(int64(initIdle))
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		buf := make([]byte, 65535)
+		buf := make([]byte, bufSz)
 		for {
-			_ = hostConn.SetReadDeadline(time.Now().Add(idleTimeout))
+			_ = hostConn.SetReadDeadline(time.Now().Add(time.Duration(idleNs.Load())))
 			n, err := hostConn.Read(buf)
 			if err != nil {
 				return
@@ -253,12 +267,18 @@ func relayUDP(guest *gonet.UDPConn, dst string, isDNS bool) {
 			if _, err := guest.Write(buf[:n]); err != nil {
 				return
 			}
+			if isDNS {
+				// Keep the 4-tuple alive briefly so dual-stack A+AAAA lookups sharing
+				// one guest source port receive the second reply without holding slots 5s.
+				idleNs.Store(int64(dnsPostReplyIdleTimeout))
+				_ = guest.SetReadDeadline(time.Now().Add(dnsPostReplyIdleTimeout))
+			}
 		}
 	}()
 
-	buf := make([]byte, 65535)
+	buf := make([]byte, bufSz)
 	for {
-		_ = guest.SetReadDeadline(time.Now().Add(idleTimeout))
+		_ = guest.SetReadDeadline(time.Now().Add(time.Duration(idleNs.Load())))
 		n, err := guest.Read(buf)
 		if err != nil {
 			break
@@ -308,12 +328,14 @@ func serveTunnel(conn io.ReadWriteCloser, ep *channel.Endpoint) {
 	log.Printf("vmnet tunnel connected (dual-stack v4+v6)")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	bw := bufio.NewWriterSize(conn, 131072)
+
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
 
 	// Netstack -> Guest: block for first packet, drain any queued burst, then flush once
 	go func() {
+		defer writerWG.Done()
 		var hdr [2]byte
 		writePkt := func(pkt *stack.PacketBuffer) error {
 			view := pkt.ToView()
@@ -384,6 +406,8 @@ func serveTunnel(conn io.ReadWriteCloser, ep *channel.Endpoint) {
 		pb.DecRef()
 	}
 	cancel()
+	_ = conn.Close()
+	writerWG.Wait()
 	log.Printf("vmnet tunnel disconnected")
 }
 
