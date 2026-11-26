@@ -99,7 +99,7 @@
 ## 目录结构与自行构建
 
 ```text
-app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.7.5）
+app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.7.6）
 app/compile-stubs/  编译期 AVF API 最小桩声明（不打包进 DEX）
 vmnet/              Go 源码：宿主 gVisor 双栈网关（libvmnet.so）与客户机隧道（vmnet-guest）
 guest/              客户机 systemd 单元、GRUB/fstab/sysctl/sshd 配置、UEFI FDT 修补器（guest/efi/）与 provision.sh

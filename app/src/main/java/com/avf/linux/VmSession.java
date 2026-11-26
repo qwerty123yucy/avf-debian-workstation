@@ -554,9 +554,10 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
                     }
                 } catch (Throwable ignored) {
                 } finally {
-                    if (!relayClosed.get()) {
-                        try { Os.shutdown(rawFd, OsConstants.SHUT_WR); } catch (Throwable ignored) {}
-                    }
+                    // SSHv2 multiplexes channel EOF inside encrypted frames and never uses
+                    // transport half-close; close both ends immediately so aborted TCP probes
+                    // do not strand sshd-session and relay permits until LoginGraceTime.
+                    try { finalHandle.close(); } catch (IOException ignored) {}
                     done.run();
                 }
             }, "tcp2vsock-" + mId);
@@ -573,9 +574,7 @@ final class VmSession implements VmController.SessionHandle, VmStreamPump.Sink {
                 }
             } catch (Throwable ignored) {
             } finally {
-                if (!relayClosed.get()) {
-                    try { sock.shutdownOutput(); } catch (IOException ignored) {}
-                }
+                try { finalHandle.close(); } catch (IOException ignored) {}
                 done.run();
             }
         } catch (Throwable e) {
