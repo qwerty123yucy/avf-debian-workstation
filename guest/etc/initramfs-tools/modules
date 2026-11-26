@@ -1,0 +1,3 @@
+# Minimal modules required in initramfs to mount the ext4 root on virtio-blk.
+# virtio_pci, virtio_console, and ext4 are built into Debian's cloud-arm64 kernel.
+virtio_blk

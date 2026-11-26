@@ -159,8 +159,8 @@ cmd_status() {
 }
 
 wait_for_ssh() {
-    local tries=35
-    for ((i = 1; i <= tries; i++)); do
+    local deadline=$((SECONDS + 35))
+    while (( SECONDS < deadline )); do
         if ssh -i "$SSH_KEY" -p "$SSH_PORT" \
             -o BatchMode=yes \
             -o ConnectTimeout=2 \
@@ -168,7 +168,7 @@ wait_for_ssh() {
             root@127.0.0.1 true >/dev/null 2>&1; then
             return 0
         fi
-        sleep 1
+        sleep 0.25
     done
     return 1
 }

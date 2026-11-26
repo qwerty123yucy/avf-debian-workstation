@@ -24,12 +24,21 @@ ssh "$TARGET_HOST" 'cat > /boot/avf-fdt-edge.efi && chmod 644 /boot/avf-fdt-edge
 ssh "$TARGET_HOST" '
 set -eu
 rm -f /etc/systemd/network/10-avf-dhcp.network
+purge=""
+for pkg in cloud-init cloud-initramfs-growroot; do
+    if dpkg -s "$pkg" >/dev/null 2>&1; then purge="$purge $pkg"; fi
+done
+if [ -n "$purge" ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y $purge
+fi
+rm -rf /etc/cloud /var/lib/cloud
 /usr/local/sbin/avf-boot-setup.sh
 sysctl --system >/dev/null 2>&1 || true
 systemctl daemon-reload
 systemctl enable vmnet-guest.service sshd-vsock.socket avf-boot-setup.service fstrim.timer
 systemctl start sshd-vsock.socket
 systemctl restart vmnet-guest.service
+update-initramfs -u
 update-grub
 '
 echo "[ok] Provisioned guest configuration onto $TARGET_HOST"

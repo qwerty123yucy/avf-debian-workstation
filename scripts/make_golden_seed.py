@@ -157,8 +157,9 @@ if [ "$SANITIZE_PUBLIC" = "1" ]; then
     rm -f /root/.ssh/authorized_keys /etc/ssh/ssh_host_* /etc/systemd/network/10-avf-dhcp.network /boot/avf-gzvm-edge.dtb
     truncate -s 0 /etc/machine-id
 fi
-if mountpoint -q /boot/efi; then
-    fstrim /boot/efi 2>/dev/null || true
+fstrim /boot/efi 2>/dev/null || true
+systemctl stop boot-efi.automount boot-efi.mount 2>/dev/null || true
+if grep -q " /boot/efi vfat " /proc/mounts; then
     umount /boot/efi
 fi
 if grep -q " / ext4 rw," /proc/mounts; then

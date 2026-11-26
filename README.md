@@ -26,7 +26,7 @@
 ## 关键调优与实测取舍
 
 - **零额外拷贝的 vsock 网络路径**：`VmService` 通过 Unix Socket `SCM_RIGHTS` 将 `vsock:2223` FD 直接移交给原生 Go 进程 `libvmnet.so`，无 Java 转发线程；`vmnet-guest` 在 raw FD 上前置 `O_NONBLOCK` 接入 Go epoll 轮询并聚合突发刷写（单次最多 64 包）；`libvmnet.so` 仅在收到 DNS 查询时懒检查 `active-dns.txt` 修改时间，实测空闲 CPU `0.0%`、常驻内存 ~`4.6 MiB`。
-- **稀疏存储与写放大控制**：64 GiB 稀疏盘实际初始占用仅 ~`1.25 GiB`；根分区 `ext4` 启用 `noatime,lazytime,x-systemd.growfs`，配合每周 `fstrim.timer` 回收空洞；`journald` 限制 `SystemMaxUse=128M`；首次启动由 `avf-boot-setup.service`（`After=local-fs.target`）提前完成分区扩容检查与缺失的 SSH 主机密钥自动生成。
+- **稀疏存储与写放大控制**：64 GiB 稀疏盘实际初始占用仅 ~`1.25 GiB`；根分区 `ext4` 启用 `noatime,lazytime`，配合每周 `fstrim.timer` 回收空洞；`journald` 限制 `SystemMaxUse=128M`；`avf-boot-setup.service` 仅在宿主扩大虚拟盘后执行 `growpart` 与在线 `resize2fs`，并在缺失 SSH 主机密钥时补生成。
 - **内存、CPU 与计时器**：宿主 4 GiB 按需分配 + 客户机 ~`2 GiB LZ4 zram0`（`vm.page-cluster=0` 避免无意义预读）；`CPU_TOPOLOGY_MATCH_HOST` 透传大小核拓扑；保留内核默认 `kernel.watchdog` 与 `vm.stat_interval`（实测在 MediaTek GenieZone 上禁用或拉长这两项会导致宿主 `crosvm` 空闲 CPU 反常暴涨约 35 倍）。
 - **数据完整性、优雅关机与防误操作**：支持从系统文件选择器直接导入下载目录中的 `.simg.gz` / `.simg`；导入前先校验文件头魔数，解包过程写入 `.tmp`、完整读至流末尾触发 GZIP CRC32 校验并 `fsync` 后再原子替换 `disk.img` 与 `seed.simg.gz`。客户机 `vmnet-guest` 监听仅限宿主（`CID=2`）访问的 `vsock:2224` 电源控制端口；宿主在点击 Stop/Restart、导入/重置前、移除最近任务卡片及收到系统关机广播时，先下发 `sync` + `systemctl poweroff` 等待客户机有序卸载文件系统（超时再回退强制停机），并保留上一轮会话的 `last-console.log` 与 `last-vmlog.log` 供排障读取。
 - **生命周期状态机与虚拟化终端**：宿主控制面采用单锁可形式化状态机（`VmController`）隔离物理阶段、目标意图与单次会话资源（`VmSession`），配合同进程 `LocalBinder`、不可变状态快照及与 `VirtualMachine` 底层管道同生命周期的单例流转发器（`VmStreamPump`，跨重启原子切换投递目标，避免非自有管道 FD 残留阻塞读线程或抢读下一轮引导首包）消除跨轮次竞态；内置控制台采用流式 VT100/ANSI 行环形缓冲（保留最近 2000 行 / 160 KB，折叠引导阶段冗余空行）与按视口虚拟化绘制的 `Canvas` 终端（流式刷新无重排开销，避免高速引导刷屏导致的空白或卡顿），软键盘采用 `BaseInputConnection` 增量差值发送。

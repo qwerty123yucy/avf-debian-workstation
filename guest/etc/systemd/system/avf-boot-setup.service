@@ -1,6 +1,6 @@
 [Unit]
-Description=AVF Debian disk grow, zram swap, and first-boot SSH host key setup
-After=local-fs.target
+Description=AVF Debian on-demand disk grow, first-boot SSH host key, and IRQ check
+After=local-fs.target sshd-keygen.service
 Before=ssh.service
 
 [Service]
