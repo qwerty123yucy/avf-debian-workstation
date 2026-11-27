@@ -220,6 +220,7 @@ public final class VmConfigStore {
 
     public synchronized void saveKeepAwake(boolean enable) {
         Properties props = loadSettings();
+        props.remove("wakelock_mode");
         props.setProperty("keep_awake", Boolean.toString(enable));
         File tmp = new File(mContext.getFilesDir(), "vm.properties.tmp");
         File dst = new File(mContext.getFilesDir(), "vm.properties");

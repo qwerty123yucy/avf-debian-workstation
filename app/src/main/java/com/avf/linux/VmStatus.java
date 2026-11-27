@@ -131,17 +131,50 @@ public final class VmStatus {
         );
     }
 
-    public String toJson(
-            VmConfigStore store,
-            boolean wakeLockCurrentlyHeld,
-            boolean wifiLockCurrentlyHeld,
-            boolean batteryUnrestricted,
-            boolean foregroundActive) {
+    public static final class RuntimeDiag {
+        public final boolean wakeLockHeld;
+        public final boolean wifiLockHeld;
+        public final boolean batteryUnrestricted;
+        public final boolean foregroundActive;
+        public final boolean keepAliveActive;
+        public final int freezeCount;
+        public final long lastFreezeMs;
+        public final long lastFreezeAgoSec;
+        public final boolean netBlocked;
+        public final int netBlockedCount;
+
+        public RuntimeDiag(
+                boolean wakeLockHeld,
+                boolean wifiLockHeld,
+                boolean batteryUnrestricted,
+                boolean foregroundActive,
+                boolean keepAliveActive,
+                int freezeCount,
+                long lastFreezeMs,
+                long lastFreezeAgoSec,
+                boolean netBlocked,
+                int netBlockedCount) {
+            this.wakeLockHeld = wakeLockHeld;
+            this.wifiLockHeld = wifiLockHeld;
+            this.batteryUnrestricted = batteryUnrestricted;
+            this.foregroundActive = foregroundActive;
+            this.keepAliveActive = keepAliveActive;
+            this.freezeCount = freezeCount;
+            this.lastFreezeMs = lastFreezeMs;
+            this.lastFreezeAgoSec = lastFreezeAgoSec;
+            this.netBlocked = netBlocked;
+            this.netBlockedCount = netBlockedCount;
+        }
+    }
+
+    public String toJson(VmConfigStore store, RuntimeDiag diag) {
         long uptime = (startedAtMs > 0 && state == State.RUNNING)
             ? Math.max(0L, (System.currentTimeMillis() - startedAtMs) / 1000L)
             : 0L;
-        long actualMb = store.getActualDiskBytes() / (1024L * 1024L);
-        long seedMb = store.getSeedBytes() / (1024L * 1024L);
+        long actualMb = (store != null) ? (store.getActualDiskBytes() / (1024L * 1024L)) : 0L;
+        long seedMb = (store != null) ? (store.getSeedBytes() / (1024L * 1024L)) : 0L;
+        boolean seedReady = (store != null) && store.hasSeed();
+        boolean imagesReady = (store != null) && store.hasImages();
         return "{"
             + "\"running\":" + (state == State.RUNNING)
             + ",\"state\":\"" + state.name() + "\""
@@ -149,18 +182,24 @@ public final class VmStatus {
             + ",\"net_mode\":\"" + esc(netMode) + "\""
             + ",\"vmnet_connected\":" + vmNetConnected
             + ",\"keep_awake\":" + keepAwake
-            + ",\"wakelock_held\":" + wakeLockCurrentlyHeld
-            + ",\"wifilock_held\":" + wifiLockCurrentlyHeld
-            + ",\"battery_unrestricted\":" + batteryUnrestricted
-            + ",\"foreground_service\":" + foregroundActive
+            + ",\"wakelock_held\":" + diag.wakeLockHeld
+            + ",\"wifilock_held\":" + diag.wifiLockHeld
+            + ",\"battery_unrestricted\":" + diag.batteryUnrestricted
+            + ",\"foreground_service\":" + diag.foregroundActive
+            + ",\"keepalive_active\":" + diag.keepAliveActive
+            + ",\"freeze_count\":" + diag.freezeCount
+            + ",\"last_freeze_ms\":" + diag.lastFreezeMs
+            + ",\"last_freeze_ago_sec\":" + diag.lastFreezeAgoSec
+            + ",\"net_blocked\":" + diag.netBlocked
+            + ",\"net_blocked_count\":" + diag.netBlockedCount
             + ",\"ssh_local\":\"127.0.0.1:" + sshPort + "\""
             + ",\"memory_mib\":" + memMib
             + ",\"disk_logical_gb\":" + diskGb
             + ",\"disk_actual_mb\":" + actualMb
-            + ",\"seed_ready\":" + store.hasSeed()
+            + ",\"seed_ready\":" + seedReady
             + ",\"seed_mb\":" + seedMb
             + ",\"uptime_sec\":" + uptime
-            + ",\"images_ready\":" + store.hasImages()
+            + ",\"images_ready\":" + imagesReady
             + ",\"error\":\"" + esc(lastError) + "\""
             + "}\n";
     }

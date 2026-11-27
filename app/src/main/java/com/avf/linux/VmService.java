@@ -16,10 +16,15 @@ import android.net.NetworkCapabilities;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.Binder;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.Parcel;
 import android.os.PowerManager;
+import android.os.RemoteException;
+import android.os.ResultReceiver;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.net.Inet4Address;
@@ -31,6 +36,7 @@ import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Thin Android Service shell adapting platform events to VmController and
@@ -52,6 +58,10 @@ public class VmService extends Service
     public static final String ACTION_ENSURE_FOREGROUND = "com.avf.linux.ACTION_ENSURE_FOREGROUND";
     public static final String EXTRA_TOKEN = "token";
     public static final String EXTRA_ENABLE = "enable";
+    private static final String EXTRA_BINDER = "binder";
+    private static final long KEEPALIVE_ACTIVE_WINDOW_MS = 15000L;
+    private static final long FREEZE_TICK_MS = 1000L;
+    private static final long FREEZE_STALL_THRESHOLD_MS = 2000L;
 
     public final class LocalBinder extends Binder {
         public VmService getService() {
@@ -60,6 +70,20 @@ public class VmService extends Service
     }
 
     private final IBinder mBinder = new LocalBinder();
+    private final Binder mKeepAliveBinder = new Binder() {
+        @Override
+        protected boolean onTransact(int code, Parcel data, Parcel reply, int flags)
+                throws RemoteException {
+            if (code == FIRST_CALL_TRANSACTION) {
+                mLastKeepAliveElapsedMs = SystemClock.elapsedRealtime();
+                if (reply != null) {
+                    reply.writeNoException();
+                }
+                return true;
+            }
+            return super.onTransact(code, data, reply, flags);
+        }
+    };
     private final Handler mMainHandler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean mFgSyncScheduled = new AtomicBoolean(false);
     private final Object mWakeLockGuard = new Object();
@@ -77,8 +101,17 @@ public class VmService extends Service
     private volatile boolean mServiceStarted = false;
     private volatile boolean mForegroundActive = false;
     private boolean mFgDegradedWarned = false;
+    private long mLastNotifiedSeq = -1L;
     private volatile int mLastStartId = -1;
     private volatile boolean mDestroyed = false;
+
+    private volatile long mLastKeepAliveElapsedMs = 0L;
+    private final AtomicInteger mFreezeCount = new AtomicInteger(0);
+    private volatile long mLastFreezeMs = 0L;
+    private volatile long mLastFreezeAtElapsedMs = 0L;
+    private volatile boolean mNetBlocked = false;
+    private final AtomicInteger mNetBlockedCount = new AtomicInteger(0);
+    private Thread mFreezeMonitorThread;
 
     private ConnectivityManager mConnMgr;
     private ConnectivityManager.NetworkCallback mNetCb;
@@ -107,6 +140,7 @@ public class VmService extends Service
         ensureNotificationChannel();
         registerShutdownReceiver();
         registerNetworkMonitor();
+        startFreezeMonitor();
 
         mCtlServer = new VmControlServer(mController.getStatus().ctlPort, mToken, this);
         mCtlServer.start();
@@ -145,8 +179,19 @@ public class VmService extends Service
 
         String action = (intent != null) ? intent.getAction() : null;
         if (action == null) {
+            if (intent != null) {
+                try {
+                    ResultReceiver rr = intent.getParcelableExtra(Intent.EXTRA_RESULT_RECEIVER);
+                    if (rr != null) {
+                        mLastKeepAliveElapsedMs = SystemClock.elapsedRealtime();
+                        Bundle reply = new Bundle(1);
+                        reply.putBinder(EXTRA_BINDER, mKeepAliveBinder);
+                        rr.send(0, reply);
+                    }
+                } catch (Throwable ignored) {}
+            }
             scheduleForegroundSync();
-            return START_STICKY;
+            return mController.getStatus().state.isActive() ? START_STICKY : START_NOT_STICKY;
         }
 
         // Fulfill startForegroundService() contract immediately when launched by action intent
@@ -197,6 +242,7 @@ public class VmService extends Service
     @Override
     public void onDestroy() {
         mDestroyed = true;
+        stopFreezeMonitor();
         mMainHandler.removeCallbacks(mSyncForegroundRunnable);
         unregisterShutdownReceiver();
         unregisterNetworkMonitor();
@@ -234,8 +280,26 @@ public class VmService extends Service
 
     @Override
     public String getStatusJson() {
-        return mController.getStatus().toJson(
-            mStore, mWakeLockHeld, mWifiLockHeld, isBatteryOptimizationIgnored(), mForegroundActive);
+        long nowElapsed = SystemClock.elapsedRealtime();
+        long lastKa = mLastKeepAliveElapsedMs;
+        boolean kaActive = (lastKa > 0L) && ((nowElapsed - lastKa) <= KEEPALIVE_ACTIVE_WINDOW_MS);
+        long lastFreezeAt = mLastFreezeAtElapsedMs;
+        long freezeAgoSec = (lastFreezeAt > 0L)
+            ? Math.max(0L, (nowElapsed - lastFreezeAt) / 1000L)
+            : -1L;
+        VmStatus.RuntimeDiag diag = new VmStatus.RuntimeDiag(
+            mWakeLockHeld,
+            mWifiLockHeld,
+            isBatteryOptimizationIgnored(),
+            mForegroundActive,
+            kaActive,
+            mFreezeCount.get(),
+            mLastFreezeMs,
+            freezeAgoSec,
+            mNetBlocked,
+            mNetBlockedCount.get()
+        );
+        return mController.getStatus().toJson(mStore, diag);
     }
     @Override public String getLiveConsoleText() { return mController.getConsole().getTextSnapshot(); }
     @Override public String getLastConsoleText() { return mStore.readLastConsoleLog(); }
@@ -341,6 +405,7 @@ public class VmService extends Service
             if (mDestroyed) return;
             mServiceStarted = false;
             mForegroundActive = false;
+            mLastNotifiedSeq = -1L;
             if (startId > 0) stopSelfResult(startId);
             else stopSelf();
         });
@@ -377,8 +442,10 @@ public class VmService extends Service
             startForeground(NOTIF_ID, notif);
             mForegroundActive = true;
             mFgDegradedWarned = false;
+            mLastNotifiedSeq = status.seq;
         } catch (Throwable t) {
             mForegroundActive = false;
+            mLastNotifiedSeq = -1L;
             Log.e(TAG, "startForeground failed; running without FGS elevation", t);
             boolean consoleReady = (status.state == VmStatus.State.RUNNING || status.state.isMaintenance());
             if (!mFgDegradedWarned && mController != null && consoleReady) {
@@ -403,10 +470,14 @@ public class VmService extends Service
                     Log.w(TAG, "startForegroundService self-start failed: " + t.getMessage());
                 }
             }
+            if (mForegroundActive && status.seq == mLastNotifiedSeq) {
+                return;
+            }
             promoteToForegroundNow(status);
         } else {
             mForegroundActive = false;
             mFgDegradedWarned = false;
+            mLastNotifiedSeq = -1L;
             try {
                 stopForeground(true);
             } catch (Throwable ignored) {}
@@ -527,11 +598,58 @@ public class VmService extends Service
                     @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities nc) {
                         refreshNetworkAndDns();
                     }
+                    @Override public void onBlockedStatusChanged(Network network, boolean blocked) {
+                        mNetBlocked = blocked;
+                        if (blocked) {
+                            mNetBlockedCount.incrementAndGet();
+                        }
+                    }
                 };
                 mConnMgr.registerDefaultNetworkCallback(mNetCb);
             }
         } catch (Throwable t) {
             Log.w(TAG, "NetworkCallback registration failed: " + t.getMessage());
+        }
+    }
+
+    private void startFreezeMonitor() {
+        mFreezeMonitorThread = new Thread(() -> {
+            long prevUptime = SystemClock.uptimeMillis();
+            long prevElapsed = SystemClock.elapsedRealtime();
+            while (!mDestroyed) {
+                try {
+                    Thread.sleep(FREEZE_TICK_MS);
+                } catch (InterruptedException ie) {
+                    break;
+                }
+                if (mDestroyed) break;
+                long nowUptime = SystemClock.uptimeMillis();
+                long nowElapsed = SystemClock.elapsedRealtime();
+                long uptimeDelta = nowUptime - prevUptime;
+                long elapsedDelta = nowElapsed - prevElapsed;
+                prevUptime = nowUptime;
+                prevElapsed = nowElapsed;
+
+                long stallMs = uptimeDelta - FREEZE_TICK_MS;
+                if (stallMs >= FREEZE_STALL_THRESHOLD_MS) {
+                    long deepSleepMs = Math.max(0L, elapsedDelta - uptimeDelta);
+                    int count = mFreezeCount.incrementAndGet();
+                    mLastFreezeMs = stallMs;
+                    mLastFreezeAtElapsedMs = nowElapsed;
+                    Log.w(TAG, "Process freeze stall detected: " + stallMs
+                        + "ms (deepSleep=" + deepSleepMs + "ms, count=" + count + ")");
+                }
+            }
+        }, "vm-freeze-mon");
+        mFreezeMonitorThread.setDaemon(true);
+        mFreezeMonitorThread.start();
+    }
+
+    private void stopFreezeMonitor() {
+        Thread t = mFreezeMonitorThread;
+        mFreezeMonitorThread = null;
+        if (t != null) {
+            t.interrupt();
         }
     }
 

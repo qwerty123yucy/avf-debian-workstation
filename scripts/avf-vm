@@ -122,6 +122,20 @@ if "battery_unrestricted" in d:
         fg_note = ", FGS degraded — open AVF Linux app"
     bg_str = "UNRESTRICTED" if bg_ok else "OPTIMIZED (open AVF Linux app to allow unrestricted background usage)"
     print(f"BgPolicy : {bg_str}{fg_note}")
+if "freeze_count" in d:
+    ka_str = "KeepAlive ON" if d.get("keepalive_active") else "KeepAlive OFF"
+    fc = int(d.get("freeze_count") or 0)
+    if fc > 0:
+        lf_ms = int(d.get("last_freeze_ms") or 0)
+        lf_ago = int(d.get("last_freeze_ago_sec") if d.get("last_freeze_ago_sec") is not None else -1)
+        ago_s = f", {lf_ago}s ago" if lf_ago >= 0 else ""
+        fr_str = f"freezes={fc} (last {lf_ms}ms{ago_s})"
+    else:
+        fr_str = "freezes=0"
+    nb = bool(d.get("net_blocked"))
+    nbc = int(d.get("net_blocked_count") or 0)
+    nb_str = f"net_blocked={str(nb).lower()}" + (f" (events={nbc})" if nbc > 0 else "")
+    print(f"BgHealth : {ka_str}, {fr_str}, {nb_str}")
 if d.get("uptime_sec"):
     up_s = d["uptime_sec"]
     print(f"Uptime   : {up_s}s")

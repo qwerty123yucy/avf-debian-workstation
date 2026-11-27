@@ -70,12 +70,18 @@
 - **通用 Android SSH 客户端**：生成密钥对后，在 App 的 **Console** 中将公钥写入 `/root/.ssh/authorized_keys`（`chmod 600`），客户端连接 `root@127.0.0.1:2222` 即可。
 - **Termux CLI 管理**：如需命令行启停/状态查询/切换 WakeLock，可安装 [`scripts/avf-vm`](scripts/avf-vm)（或运行 [`scripts/setup-termux.sh`](scripts/setup-termux.sh)），在 App 中点击 **Copy Token** 保存到 `~/.config/avf-linux/token`（`chmod 600`）：
   ```bash
-  avf-vm status         # 查看运行态、稀疏盘占用、网络模式与 WakeLock
+  avf-vm status         # 查看运行态、稀疏盘占用、网络模式、WakeLock 与冻结/网络封锁统计
   avf-vm start          # 启动虚拟机
   avf-vm wakelock on    # 息屏长任务按需持锁（off 恢复默认）
   avf-vm reset          # 从宿主初始种子还原系统
   avf-vm stop           # 优雅关机并等待停稳
   avf-vm console --last # 查看上一轮会话保存的串口或 vmlog (--vmlog)
+  ```
+- **可选：原生 Termux 通用 Binder 保活（`binder-keepalive`）**：部分 OEM 系统（如 ColorOS `OplusHansManager`）即使对应用开启忽略电池优化，亮屏后台空闲时仍可能对其执行 `cgroup.freeze` 冻结。[`scripts/binder-keepalive`](scripts/binder-keepalive)（源码见 `tools/binder-keepalive/`，与 `com.avf.linux` 解耦，可用于任意导出 `Service`）在原生 Termux 中以单实例 `app_process` 运行，通过标准 `Intent.EXTRA_RESULT_RECEIVER` 握手获取裸 `IBinder` 后按默认 `2s` 同步 `/dev/binder` 事务 + `10s` `startService` 维持目标活跃；当用户离开 Termux、Termux 自身被系统冻结时自动随之暂停：
+  ```bash
+  binder-keepalive start com.avf.linux/.VmService  # 对指定导出 Service 开启保活
+  binder-keepalive status                          # 查看当前保活目标与计数
+  binder-keepalive stop                            # 停止保活并退出守护进程
   ```
 - **可选：按需开启宿主机 ADB 调试隧道**：虚拟机默认不暴露宿主机回环接口。如需在 Debian 内通过独立 `adb` 调试本机（前提：宿主已开启 `adb tcpip 5555`，客户机已 `apt install -y adb`），可使用 [`scripts/avf-adb`](scripts/avf-adb)（通过 OpenSSH `ControlMaster` 独立隧道将宿主 `127.0.0.1:5555` 映射至客户机 `127.0.0.1:15555`——与交互 `ssh avf` 解耦以避免退出挂起，并避开 ADB `5555..5585` 本地模拟器扫描段以防重复设备）：
   ```bash
@@ -100,11 +106,12 @@
 ## 目录结构与自行构建
 
 ```text
-app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.7.8）
-app/compile-stubs/  编译期 AVF API 最小桩声明（不打包进 DEX）
-vmnet/              Go 源码：宿主 gVisor 双栈网关（libvmnet.so）与客户机隧道（vmnet-guest）
-guest/              客户机 systemd 单元、GRUB/fstab/sysctl/sshd 配置、UEFI FDT 修补器（guest/efi/）与 provision.sh
-scripts/            build_apk.py、make_golden_seed.py、avf-vm、avf-adb、setup-termux.sh
+app/src/main/           Android Material 3 宿主应用源码（com.avf.linux v1.7.12）
+app/compile-stubs/      编译期 AVF API 最小桩声明（不打包进 DEX）
+tools/binder-keepalive/ 独立通用 Android Binder 保活工具源码与构建脚本
+vmnet/                  Go 源码：宿主 gVisor 双栈网关（libvmnet.so）与客户机隧道（vmnet-guest）
+guest/                  客户机 systemd 单元、GRUB/fstab/sysctl/sshd 配置、UEFI FDT 修补器（guest/efi/）与 provision.sh
+scripts/                build_apk.py、make_golden_seed.py、avf-vm、binder-keepalive、avf-adb、setup-termux.sh
 ```
 
 构建前需准备 Go 1.24+、GCC/binutils（ARM64 宿主或交叉工具链）、JDK（`javac`/`keytool`）及 Android SDK Build-Tools（设置 `ANDROID_HOME`）：
@@ -117,8 +124,9 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o ../
 cd ..
 ./guest/efi/build_efi.sh
 
-# 2. 编译、16 KB 对齐并签名 APK（可通过 AVF_KS_PASS 指定密钥库口令）
+# 2. 编译、16 KB 对齐并签名 APK（可通过 AVF_KS_PASS 指定密钥库口令），以及构建通用 Binder 保活工具
 python3 scripts/build_apk.py
+python3 tools/binder-keepalive/build_keepalive.py
 
 # 3. 同步客户机配置并导出脱敏版初始种子（默认清除 SSH 密钥与 machine-id）
 ./guest/provision.sh

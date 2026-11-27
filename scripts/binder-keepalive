@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+# Generic Android Binder keepalive utility for Termux / host Android shells.
+# Keeps explicitly specified exported Services responsive via lightweight
+# synchronous /dev/binder transactions + periodic startService refreshes while
+# the caller's own UID remains unfrozen.
+set -euo pipefail
+
+JAR_SHA256="fb4f2614d3f4809c7c13a62a8a55a1ee157bf4cc2f1ba9ca6e590147e0478ca9"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/binder-keepalive"
+JAR_PATH="$CACHE_DIR/keepalive-${JAR_SHA256:0:16}.jar"
+
+ensure_host_android() {
+    if [[ -n "${PROOT_TMP_DIR:-}" ]]; then
+        echo "Error: binder-keepalive must run in native Termux (not inside a proot container) so it shares Termux's Android UID and /dev/binder." >&2
+        exit 1
+    fi
+    if [[ ! -x /system/bin/app_process ]]; then
+        echo "Error: /system/bin/app_process not found (must run on Android host / native Termux)." >&2
+        exit 1
+    fi
+}
+
+ensure_dex_jar() {
+    mkdir -p "$CACHE_DIR"
+    chmod 700 "$CACHE_DIR"
+    if [[ -f "$JAR_PATH" && "$(stat -c '%a' "$JAR_PATH" 2>/dev/null || true)" == "400" ]]; then
+        return 0
+    fi
+    local tmp="$CACHE_DIR/.tmp.$$.jar"
+    rm -f "$tmp" "$JAR_PATH"
+    base64 -d > "$tmp" <<'__DEX_EOF__'
+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
+__DEX_EOF__
+    # Android 14+ Safer Dynamic Code Loading requires read-only DEX files (0400).
+    chmod 0400 "$tmp"
+    mv -f "$tmp" "$JAR_PATH"
+    chmod 0400 "$JAR_PATH"
+}
+
+run_app_process() {
+    CLASSPATH="$JAR_PATH" \
+    env -u LD_LIBRARY_PATH -u LD_PRELOAD \
+        /system/bin/app_process -Xnoimage-dex2oat / --nice-name=binder-keepalive \
+        org.keepalive.binder.BinderKeepAlive "$@"
+}
+
+ipc_send() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$@" <<'PY'
+import os, socket, sys
+cmd = " ".join(sys.argv[1:]) + "\n"
+addr = b"\x00binder-keepalive-" + str(os.getuid()).encode("ascii")
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(4.0)
+try:
+    s.connect(addr)
+except OSError:
+    sys.exit(3)
+s.sendall(cmd.encode("utf-8"))
+chunks = []
+while True:
+    data = s.recv(4096)
+    if not data:
+        break
+    chunks.append(data)
+s.close()
+text = b"".join(chunks).decode("utf-8", errors="replace")
+if not text:
+    sys.exit(1)
+lines = text.splitlines()
+first = lines[0]
+if first.startswith("ERR "):
+    sys.stderr.write("Error: " + first[4:] + "\n")
+    sys.exit(1)
+if first.startswith("OK "):
+    print(first[3:])
+else:
+    print(first)
+for line in lines[1:]:
+    print(line)
+PY
+    else
+        ensure_dex_jar
+        run_app_process ctl "$@"
+    fi
+}
+
+validate_component_syntax() {
+    local comp="$1"
+    if [[ "$comp" != */* || "$comp" == /* || "$comp" == */ ]]; then
+        echo "Error: component must be <package>/<service-class> (e.g. com.example/.MyService)" >&2
+        exit 2
+    fi
+}
+
+cmd_start() {
+    local comp="" ping_ms="2000" start_ms="10000" calling_pkg=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ping-ms)
+                ping_ms="${2:-}"; shift 2 ;;
+            --start-ms)
+                start_ms="${2:-}"; shift 2 ;;
+            --calling-pkg)
+                calling_pkg="${2:-}"; shift 2 ;;
+            -*)
+                echo "Error: unknown option '$1'" >&2; usage >&2; exit 2 ;;
+            *)
+                if [[ -z "$comp" ]]; then
+                    comp="$1"; shift
+                else
+                    echo "Error: unexpected argument '$1'" >&2; usage >&2; exit 2
+                fi
+                ;;
+        esac
+    done
+    if [[ -z "$comp" ]]; then
+        echo "Error: missing <package>/<service> target" >&2
+        usage >&2
+        exit 2
+    fi
+    validate_component_syntax "$comp"
+    if ! [[ "$ping_ms" =~ ^[0-9]+$ && "$start_ms" =~ ^[0-9]+$ ]]; then
+        echo "Error: --ping-ms and --start-ms must be positive integers" >&2
+        exit 2
+    fi
+
+    ensure_host_android
+    ensure_dex_jar
+
+    if ! ipc_send PING >/dev/null 2>&1; then
+        local log_file="$CACHE_DIR/daemon.log"
+        : > "$log_file"
+        chmod 600 "$log_file"
+        CLASSPATH="$JAR_PATH" \
+        env -u LD_LIBRARY_PATH -u LD_PRELOAD \
+            nohup /system/bin/app_process -Xnoimage-dex2oat / --nice-name=binder-keepalive \
+            org.keepalive.binder.BinderKeepAlive daemon "$calling_pkg" \
+            >"$log_file" 2>&1 </dev/null &
+        local daemon_pid=$!
+
+        local ready=0
+        for ((i = 1; i <= 35; i++)); do
+            if ipc_send PING >/dev/null 2>&1; then
+                ready=1
+                break
+            fi
+            if ! kill -0 "$daemon_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+        if (( ! ready )); then
+            echo "Error: binder-keepalive daemon failed to start" >&2
+            if [[ -s "$log_file" ]]; then
+                cat "$log_file" >&2
+            fi
+            exit 1
+        fi
+    fi
+
+    ipc_send START "$comp" "$ping_ms" "$start_ms"
+}
+
+cmd_stop() {
+    local target="${1:---all}"
+    if [[ "$target" != "--all" && "$target" != "all" ]]; then
+        validate_component_syntax "$target"
+    fi
+    ensure_host_android
+    local rc=0
+    ipc_send STOP "$target" || rc=$?
+    if (( rc == 3 )); then
+        echo "binder-keepalive is not running."
+        return 0
+    fi
+    return "$rc"
+}
+
+cmd_status() {
+    local json_mode=0
+    [[ "${1:-}" == "--json" ]] && json_mode=1
+    ensure_host_android
+    local rc=0
+    if (( json_mode )); then
+        ipc_send STATUS_JSON || rc=$?
+        if (( rc == 3 )); then
+            echo '{"running":false,"targets":[]}'
+            return 0
+        fi
+    else
+        ipc_send STATUS || rc=$?
+        if (( rc == 3 )); then
+            echo "Daemon   : STOPPED"
+            echo "Targets  : 0"
+            return 0
+        fi
+    fi
+    return "$rc"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: binder-keepalive <command> [options]
+
+Commands:
+  start <pkg>/<service> [--ping-ms N] [--start-ms M]
+      Start or update keepalive for an exported Android Service component
+      (default: --ping-ms 2000, --start-ms 10000).
+  stop [<pkg>/<service> | --all]
+      Stop keepalive for one target or all targets (daemon exits when empty).
+  status [--json]
+      Show active keepalive targets and transaction counters.
+EOF
+}
+
+case "${1:-}" in
+    start)  shift; cmd_start "$@" ;;
+    stop)   shift; cmd_stop "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) echo "Unknown command: $1" >&2; usage >&2; exit 2 ;;
+esac
