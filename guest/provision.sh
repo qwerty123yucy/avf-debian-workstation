@@ -36,6 +36,8 @@ rm -rf /etc/cloud /var/lib/cloud /var/log/unattended-upgrades
 /usr/local/sbin/avf-boot-setup.sh
 sysctl --system >/dev/null 2>&1 || true
 systemctl daemon-reload
+env XDG_RUNTIME_DIR=/run/user/0 systemctl --user daemon-reload 2>/dev/null || true
+systemctl restart systemd-timesyncd.service systemd-udevd.service systemd-journald.service systemd-logind.service 2>/dev/null || true
 systemctl disable --now apt-daily.timer apt-daily-upgrade.timer e2scrub_all.timer 2>/dev/null || true
 systemctl enable vmnet-guest.service sshd-vsock.socket avf-boot-setup.service fstrim.timer
 systemctl start sshd-vsock.socket
