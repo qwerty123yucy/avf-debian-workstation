@@ -110,8 +110,18 @@ act_mb = d.get("disk_actual_mb", 0)
 log_gb = d.get("disk_logical_gb", 64)
 print(f"Storage  : {act_mb} MiB used / {log_gb} GiB sparse{seed_str}")
 wl_pref = "ON" if d.get("keep_awake") else "OFF"
-wl_held = "held" if d.get("wakelock_held") else "host sleep allowed"
+if d.get("wakelock_held"):
+    wl_held = "CPU + Wi-Fi held" if d.get("wifilock_held") else "CPU held"
+else:
+    wl_held = "host sleep allowed"
 print(f"WakeLock : {wl_pref} ({wl_held})")
+if "battery_unrestricted" in d:
+    bg_ok = d.get("battery_unrestricted")
+    fg_note = ""
+    if d.get("running") and "foreground_service" in d and not d.get("foreground_service"):
+        fg_note = ", FGS degraded — open AVF Linux app"
+    bg_str = "UNRESTRICTED" if bg_ok else "OPTIMIZED (open AVF Linux app to allow unrestricted background usage)"
+    print(f"BgPolicy : {bg_str}{fg_note}")
 if d.get("uptime_sec"):
     up_s = d["uptime_sec"]
     print(f"Uptime   : {up_s}s")
@@ -443,7 +453,7 @@ Commands:
   restart                  Stop and start the VM
   reset [--yes]            Erase disk changes and restore initial Debian 13 seed image
   status [--json]          Show VM status (pass --json for raw JSON)
-  wakelock [on|off|toggle] Inspect or change host CPU WakeLock policy (default: off)
+  wakelock [on|off|toggle] Inspect or change host CPU + Wi-Fi WakeLock policy (default: off)
   ssh [cmd]                Open SSH shell (or execute remote command) via loopback vsock
   console [--last|--vmlog] Print hvc0 console (or previous session / crosvm log)
   import                   Import staged seed.simg.gz / disk.simg from Android/data/com.avf.linux/files/staging

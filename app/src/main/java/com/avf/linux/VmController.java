@@ -303,7 +303,7 @@ public final class VmController {
         }
         mHost.saveKeepAwake(enable);
         appendLog("[AVF Linux] WakeLock policy: "
-            + (enable ? "ON (PARTIAL_WAKE_LOCK held while VM runs)" : "OFF (host suspend allowed)") + "\n");
+            + (enable ? "ON (PARTIAL_WAKE_LOCK + High-Perf WifiLock held while VM runs)" : "OFF (host suspend allowed)") + "\n");
         mHost.onStateInvalidated();
         notifyListeners();
     }

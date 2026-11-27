@@ -19,7 +19,7 @@
   - 客户机 `vmnet-guest` 通过 `virtio-vsock:2223` 封装 IPv4/IPv6 包（`10.0.2.2/24` + `fd00:a7f::2/64`），宿主 `libvmnet.so` 以 `com.avf.linux` 自身 UID 在用户态运行 gVisor 双栈协议栈对外建连，自动继承宿主当前网络与 VPN 路由，并按需同步 Android 活跃主备 DNS（`10.0.2.3` / `10.0.2.4`）。
 - **纯精简外设 + 默认不持 WakeLock**
   - 不挂载虚拟 GPU、音频、USB 或 `virtio-fs`，只保留运行稳定工作站所需的最小设备面。
-  - 默认 `WakeLock: OFF`，放行手机灭屏正常休眠；仅在需要息屏跑无人值守任务时，从概览页、通知栏或 CLI 显式开启。
+  - 默认 `WakeLock: OFF`，放行手机灭屏正常休眠；仅在需要息屏跑无人值守任务或保持长连接不断流时，从概览页、通知栏或 CLI 显式开启（同步持有 `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` 高性能 `WifiLock`）。
 
 ---
 
@@ -52,9 +52,10 @@
      adb shell pm grant --user 0 com.avf.linux android.permission.MANAGE_VIRTUAL_MACHINE
      adb shell pm grant --user 0 com.avf.linux android.permission.USE_CUSTOM_VIRTUAL_MACHINE
      adb shell pm grant --user 0 com.avf.linux android.permission.POST_NOTIFICATIONS
+     adb shell dumpsys deviceidle whitelist +com.avf.linux
      adb shell settings put global hidden_api_blacklist_exemptions 'Landroid/system/virtualmachine/'
      ```
-   - 打开 **AVF Linux -> Settings**，在系统电池设置中允许应用后台活动，并在系统最近任务界面给应用卡片加锁（避免 ColorOS 等系统在未锁卡上滑清理时按包名发送 `SIGKILL` 强杀进程）。
+   - 若升级或安装时未连接 ADB，直接打开 **AVF Linux** 点击顶部的后台优化提示条（在系统弹窗中允许忽略电池优化 / 无限制后台运行），并在 **Settings**（系统应用详情 -> 耗电管理）中允许应用后台活动、在系统最近任务界面给应用卡片加锁（避免 ColorOS 等系统在后台速冻或未锁卡上滑清理时按包名发送 `SIGKILL` 强杀进程）。
 3. **导入、启动与使用**
    - 在 App 内点击 **Import**，直接选取刚下载的 `seed-debian13-arm64.simg.gz`（等待约 6 秒完成校验与解包）。
    - 点击 **Start VM**，切到 **Console** 标签页等待约 15–20 秒即自动以 `root` 登录 Debian 13（首次启动自动生成本机独立的 `/etc/machine-id` 与 SSH 主机密钥）。
@@ -99,7 +100,7 @@
 ## 目录结构与自行构建
 
 ```text
-app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.7.7）
+app/src/main/       Android Material 3 宿主应用源码（com.avf.linux v1.7.8）
 app/compile-stubs/  编译期 AVF API 最小桩声明（不打包进 DEX）
 vmnet/              Go 源码：宿主 gVisor 双栈网关（libvmnet.so）与客户机隧道（vmnet-guest）
 guest/              客户机 systemd 单元、GRUB/fstab/sysctl/sshd 配置、UEFI FDT 修补器（guest/efi/）与 provision.sh

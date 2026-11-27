@@ -131,7 +131,12 @@ public final class VmStatus {
         );
     }
 
-    public String toJson(VmConfigStore store, boolean wakeLockCurrentlyHeld) {
+    public String toJson(
+            VmConfigStore store,
+            boolean wakeLockCurrentlyHeld,
+            boolean wifiLockCurrentlyHeld,
+            boolean batteryUnrestricted,
+            boolean foregroundActive) {
         long uptime = (startedAtMs > 0 && state == State.RUNNING)
             ? Math.max(0L, (System.currentTimeMillis() - startedAtMs) / 1000L)
             : 0L;
@@ -145,6 +150,9 @@ public final class VmStatus {
             + ",\"vmnet_connected\":" + vmNetConnected
             + ",\"keep_awake\":" + keepAwake
             + ",\"wakelock_held\":" + wakeLockCurrentlyHeld
+            + ",\"wifilock_held\":" + wifiLockCurrentlyHeld
+            + ",\"battery_unrestricted\":" + batteryUnrestricted
+            + ",\"foreground_service\":" + foregroundActive
             + ",\"ssh_local\":\"127.0.0.1:" + sshPort + "\""
             + ",\"memory_mib\":" + memMib
             + ",\"disk_logical_gb\":" + diskGb

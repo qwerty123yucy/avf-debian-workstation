@@ -23,6 +23,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
@@ -300,6 +301,8 @@ public class MainActivity extends Activity {
     private volatile long mLastFlushUptimeMs = 0L;
     private long mLastStateSeq = -1L;
     private long mLastConsoleSeq = -1L;
+    private Boolean mLastBatteryUnrestricted = null;
+    private boolean mBatteryPromptShown = false;
 
     private final ServiceConnection mServiceConn = new ServiceConnection() {
         @Override
@@ -308,6 +311,7 @@ public class MainActivity extends Activity {
             mService = ((VmService.LocalBinder) binder).getService();
             if (mResumed) {
                 mService.getController().addListener(mVmListener);
+                healServiceForegroundIfActive();
             }
             runPendingAutoActionIfReady();
             mLastStateSeq = -1L;
@@ -461,6 +465,7 @@ public class MainActivity extends Activity {
         mLastConsoleSeq = -1L;
         if (mService != null) {
             mService.getController().addListener(mVmListener);
+            healServiceForegroundIfActive();
             runPendingAutoActionIfReady();
         }
         refreshUi();
@@ -663,6 +668,9 @@ public class MainActivity extends Activity {
 
         mBtnPrimary = makePillButton("Start VM", 48, v -> {
             boolean running = (currentStatus().state == VmStatus.State.RUNNING);
+            if (!running) {
+                promptBatteryExemptionOnceIfNeeded();
+            }
             sendVmAction(running ? VmService.ACTION_STOP : VmService.ACTION_START);
         });
         LinearLayout.LayoutParams pLp = new LinearLayout.LayoutParams(0, dp(48), 1.35f);
@@ -1031,9 +1039,12 @@ public class MainActivity extends Activity {
 
     private void toggleWakeLockPref() {
         boolean next = !currentStatus().keepAwake;
+        if (next) {
+            promptBatteryExemptionOnceIfNeeded();
+        }
         sendWakeLockSet(next);
         Toast.makeText(this,
-            next ? "WakeLock ON (host CPU stays awake while VM runs)"
+            next ? "WakeLock ON (CPU + High-Perf Wi-Fi locks held while VM runs)"
                  : "WakeLock OFF (host sleep allowed)",
             Toast.LENGTH_SHORT).show();
     }
@@ -1051,6 +1062,56 @@ public class MainActivity extends Activity {
         i.putExtra(VmService.EXTRA_ENABLE, enable);
         startForegroundService(i);
         refreshUi();
+    }
+
+    private boolean hasCoreVmPermissions() {
+        return checkSelfPermission(PERM_MANAGE_VM) == PackageManager.PERMISSION_GRANTED
+            && checkSelfPermission(PERM_CUSTOM_VM) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean isBatteryOptimizationIgnored() {
+        PowerManager pm = getSystemService(PowerManager.class);
+        return pm == null || pm.isIgnoringBatteryOptimizations(getPackageName());
+    }
+
+    private void requestIgnoreBatteryOptimizations() {
+        if (isBatteryOptimizationIgnored()) {
+            refreshUi();
+            return;
+        }
+        try {
+            Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:" + getPackageName()));
+            startActivity(i);
+            return;
+        } catch (Throwable ignored) {}
+        try {
+            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            return;
+        } catch (Throwable ignored) {}
+        openAppSettings();
+    }
+
+    private void promptBatteryExemptionOnceIfNeeded() {
+        if (!mBatteryPromptShown && hasCoreVmPermissions() && !isBatteryOptimizationIgnored()) {
+            mBatteryPromptShown = true;
+            requestIgnoreBatteryOptimizations();
+        }
+    }
+
+    private void ensureServiceForeground() {
+        try {
+            Intent i = new Intent(this, VmService.class);
+            i.setAction(VmService.ACTION_ENSURE_FOREGROUND);
+            startForegroundService(i);
+        } catch (Throwable ignored) {}
+    }
+
+    private void healServiceForegroundIfActive() {
+        if (mService != null && mService.getStatus().state.isActive()
+                && (!mService.isServiceStarted() || !mService.isForegroundActive())) {
+            ensureServiceForeground();
+        }
     }
 
     private void openAppSettings() {
@@ -1339,6 +1400,12 @@ public class MainActivity extends Activity {
 
     private void sendVmAction(String action) {
         if (mService != null) {
+            if (VmService.ACTION_START.equals(action)
+                    || VmService.ACTION_RESTART.equals(action)
+                    || VmService.ACTION_IMPORT.equals(action)
+                    || VmService.ACTION_RESET.equals(action)) {
+                ensureServiceForeground();
+            }
             if (VmService.ACTION_START.equals(action)) mService.requestStart();
             else if (VmService.ACTION_STOP.equals(action)) mService.requestStop();
             else if (VmService.ACTION_RESTART.equals(action)) mService.requestRestart();
@@ -1364,9 +1431,12 @@ public class MainActivity extends Activity {
     private void refreshUi() {
         final VmStatus status = currentStatus();
         long stateSeq = status.seq;
-        boolean stateChanged = (stateSeq != mLastStateSeq);
+        boolean batteryUnrestricted = isBatteryOptimizationIgnored();
+        boolean stateChanged = (stateSeq != mLastStateSeq)
+            || (mLastBatteryUnrestricted == null || mLastBatteryUnrestricted.booleanValue() != batteryUnrestricted);
         if (stateChanged) {
             mLastStateSeq = stateSeq;
+            mLastBatteryUnrestricted = Boolean.valueOf(batteryUnrestricted);
             boolean hasManage = checkSelfPermission(PERM_MANAGE_VM) == PackageManager.PERMISSION_GRANTED;
             boolean hasCustom = checkSelfPermission(PERM_CUSTOM_VM) == PackageManager.PERMISSION_GRANTED;
             VmStatus.State st = status.state;
@@ -1376,11 +1446,23 @@ public class MainActivity extends Activity {
 
             if (!hasManage || !hasCustom) {
                 mPermBanner.setVisibility(View.VISIBLE);
+                mPermBanner.setTypeface(loadMonoFont());
+                mPermBanner.setBackground(roundRect(mPal.warnContainer, 0, 14));
+                mPermBanner.setOnClickListener(null);
+                mPermBanner.setClickable(false);
                 mPermBanner.setText("One-time ADB / wireless debugging grant required:\n"
                     + "adb shell pm grant com.avf.linux " + PERM_MANAGE_VM + "\n"
                     + "adb shell pm grant com.avf.linux " + PERM_CUSTOM_VM + "\n"
                     + "adb shell settings put global hidden_api_blacklist_exemptions 'Landroid/system/virtualmachine/'");
+            } else if (!batteryUnrestricted) {
+                mPermBanner.setVisibility(View.VISIBLE);
+                mPermBanner.setTypeface(Typeface.SANS_SERIF);
+                mPermBanner.setBackground(pillButtonBg(mPal.warnContainer, 0, 14));
+                mPermBanner.setOnClickListener(v -> requestIgnoreBatteryOptimizations());
+                mPermBanner.setText("Background optimization active — Android may throttle or freeze SSH & VM network in background. Tap here to allow unrestricted background usage.");
             } else {
+                mPermBanner.setOnClickListener(null);
+                mPermBanner.setClickable(false);
                 mPermBanner.setVisibility(View.GONE);
             }
 

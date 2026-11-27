@@ -14,6 +14,7 @@ import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.Uri;
+import android.net.wifi.WifiManager;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.IBinder;
@@ -48,6 +49,7 @@ public class VmService extends Service
     public static final String ACTION_RESET = "com.avf.linux.ACTION_RESET";
     public static final String ACTION_TOGGLE_WAKELOCK = "com.avf.linux.ACTION_TOGGLE_WAKELOCK";
     public static final String ACTION_SET_WAKELOCK = "com.avf.linux.ACTION_SET_WAKELOCK";
+    public static final String ACTION_ENSURE_FOREGROUND = "com.avf.linux.ACTION_ENSURE_FOREGROUND";
     public static final String EXTRA_TOKEN = "token";
     public static final String EXTRA_ENABLE = "enable";
 
@@ -69,8 +71,12 @@ public class VmService extends Service
     private VmControlServer mCtlServer;
 
     private PowerManager.WakeLock mWakeLock;
+    private WifiManager.WifiLock mWifiLock;
     private volatile boolean mWakeLockHeld = false;
+    private volatile boolean mWifiLockHeld = false;
     private volatile boolean mServiceStarted = false;
+    private volatile boolean mForegroundActive = false;
+    private boolean mFgDegradedWarned = false;
     private volatile int mLastStartId = -1;
     private volatile boolean mDestroyed = false;
 
@@ -119,6 +125,19 @@ public class VmService extends Service
         return mController.getStatus();
     }
 
+    public boolean isServiceStarted() {
+        return mServiceStarted;
+    }
+
+    public boolean isForegroundActive() {
+        return mForegroundActive;
+    }
+
+    public boolean isBatteryOptimizationIgnored() {
+        PowerManager pm = getSystemService(PowerManager.class);
+        return pm == null || pm.isIgnoringBatteryOptimizations(getPackageName());
+    }
+
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         mServiceStarted = true;
@@ -131,9 +150,12 @@ public class VmService extends Service
         }
 
         // Fulfill startForegroundService() contract immediately when launched by action intent
-        try {
-            startForeground(NOTIF_ID, buildNotification(mController.getStatus()));
-        } catch (Throwable ignored) {}
+        promoteToForegroundNow(mController.getStatus());
+
+        if (ACTION_ENSURE_FOREGROUND.equals(action)) {
+            scheduleForegroundSync();
+            return START_STICKY;
+        }
 
         String tok = intent.getStringExtra(EXTRA_TOKEN);
         if (!isValidToken(tok)) {
@@ -210,7 +232,11 @@ public class VmService extends Service
     // VmControlServer.Controller
     // -------------------------------------------------------------------------
 
-    @Override public String getStatusJson() { return mController.getStatus().toJson(mStore, mWakeLockHeld); }
+    @Override
+    public String getStatusJson() {
+        return mController.getStatus().toJson(
+            mStore, mWakeLockHeld, mWifiLockHeld, isBatteryOptimizationIgnored(), mForegroundActive);
+    }
     @Override public String getLiveConsoleText() { return mController.getConsole().getTextSnapshot(); }
     @Override public String getLastConsoleText() { return mStore.readLastConsoleLog(); }
 
@@ -313,6 +339,8 @@ public class VmService extends Service
     public void onIdleServiceExitRequested(final int startId) {
         mMainHandler.post(() -> {
             if (mDestroyed) return;
+            mServiceStarted = false;
+            mForegroundActive = false;
             if (startId > 0) stopSelfResult(startId);
             else stopSelf();
         });
@@ -343,28 +371,49 @@ public class VmService extends Service
         }
     }
 
+    private void promoteToForegroundNow(VmStatus status) {
+        Notification notif = buildNotification(status);
+        try {
+            startForeground(NOTIF_ID, notif);
+            mForegroundActive = true;
+            mFgDegradedWarned = false;
+        } catch (Throwable t) {
+            mForegroundActive = false;
+            Log.e(TAG, "startForeground failed; running without FGS elevation", t);
+            boolean consoleReady = (status.state == VmStatus.State.RUNNING || status.state.isMaintenance());
+            if (!mFgDegradedWarned && mController != null && consoleReady) {
+                mFgDegradedWarned = true;
+                mController.appendLog("[AVF Linux] Warning: OS blocked foreground service elevation ("
+                    + t.getClass().getSimpleName()
+                    + "); allow unrestricted battery usage in AVF Linux to prevent background freezes.\n");
+            }
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm != null) nm.notify(NOTIF_ID, notif);
+        }
+    }
+
     private void applyForegroundProjection(VmStatus status) {
         if (status.state.isActive()) {
             if (!mServiceStarted) {
                 try {
-                    startService(new Intent(this, VmService.class));
+                    Intent ensure = new Intent(this, VmService.class).setAction(ACTION_ENSURE_FOREGROUND);
+                    startForegroundService(ensure);
                     mServiceStarted = true;
-                } catch (Throwable ignored) {}
+                } catch (Throwable t) {
+                    Log.w(TAG, "startForegroundService self-start failed: " + t.getMessage());
+                }
             }
-            Notification notif = buildNotification(status);
-            try {
-                startForeground(NOTIF_ID, notif);
-            } catch (Throwable t) {
-                NotificationManager nm = getSystemService(NotificationManager.class);
-                if (nm != null) nm.notify(NOTIF_ID, notif);
-            }
+            promoteToForegroundNow(status);
         } else {
+            mForegroundActive = false;
+            mFgDegradedWarned = false;
             try {
                 stopForeground(true);
             } catch (Throwable ignored) {}
         }
     }
 
+    @SuppressWarnings("deprecation")
     private void applyWakeLockProjection() {
         boolean heldNow;
         synchronized (mWakeLockGuard) {
@@ -384,13 +433,37 @@ public class VmService extends Service
                     }
                 }
                 if (mWakeLock != null && !mWakeLock.isHeld()) {
-                    mWakeLock.acquire();
+                    try {
+                        mWakeLock.acquire();
+                    } catch (Throwable t) {
+                        Log.w(TAG, "WakeLock acquire failed: " + t.getMessage());
+                    }
                 }
-            } else if (mWakeLock != null && mWakeLock.isHeld()) {
-                mWakeLock.release();
+                if (mWifiLock == null) {
+                    WifiManager wm = getApplicationContext().getSystemService(WifiManager.class);
+                    if (wm != null) {
+                        mWifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "AvfLinux:VmWifi");
+                        mWifiLock.setReferenceCounted(false);
+                    }
+                }
+                if (mWifiLock != null && !mWifiLock.isHeld()) {
+                    try {
+                        mWifiLock.acquire();
+                    } catch (Throwable t) {
+                        Log.w(TAG, "WifiLock acquire failed: " + t.getMessage());
+                    }
+                }
+            } else {
+                if (mWifiLock != null && mWifiLock.isHeld()) {
+                    try { mWifiLock.release(); } catch (Throwable ignored) {}
+                }
+                if (mWakeLock != null && mWakeLock.isHeld()) {
+                    try { mWakeLock.release(); } catch (Throwable ignored) {}
+                }
             }
             heldNow = (mWakeLock != null && mWakeLock.isHeld());
             mWakeLockHeld = heldNow;
+            mWifiLockHeld = (mWifiLock != null && mWifiLock.isHeld());
         }
         if (mController != null) {
             mController.updateWakeLockHeld(heldNow);
@@ -399,9 +472,13 @@ public class VmService extends Service
 
     private void releaseWakeLock() {
         synchronized (mWakeLockGuard) {
+            if (mWifiLock != null && mWifiLock.isHeld()) {
+                try { mWifiLock.release(); } catch (Throwable ignored) {}
+            }
             if (mWakeLock != null && mWakeLock.isHeld()) {
                 try { mWakeLock.release(); } catch (Throwable ignored) {}
             }
+            mWifiLockHeld = false;
             mWakeLockHeld = false;
         }
     }
@@ -531,7 +608,7 @@ public class VmService extends Service
         Intent toggleIntent = new Intent(this, VmService.class);
         toggleIntent.setAction(running ? ACTION_STOP : ACTION_START);
         toggleIntent.putExtra(EXTRA_TOKEN, mToken);
-        PendingIntent togglePi = PendingIntent.getService(
+        PendingIntent togglePi = PendingIntent.getForegroundService(
             this, 1, toggleIntent, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
 
         String sub;
@@ -552,6 +629,8 @@ public class VmService extends Service
             .setSmallIcon(R.drawable.ic_launcher)
             .setContentTitle("AVF Linux (" + st.state.name() + ")")
             .setContentText(sub)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setOnlyAlertOnce(true)
             .setOngoing(active)
             .setContentIntent(openPi);
         if (!maintenance && !stopping) {
@@ -561,7 +640,7 @@ public class VmService extends Service
                 Intent wlIntent = new Intent(this, VmService.class);
                 wlIntent.setAction(ACTION_TOGGLE_WAKELOCK);
                 wlIntent.putExtra(EXTRA_TOKEN, mToken);
-                PendingIntent wlPi = PendingIntent.getService(
+                PendingIntent wlPi = PendingIntent.getForegroundService(
                     this, 2, wlIntent, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
                 nb.addAction(new Notification.Action.Builder(
                     null, st.keepAwake ? "WakeLock: ON" : "WakeLock: OFF", wlPi).build());
