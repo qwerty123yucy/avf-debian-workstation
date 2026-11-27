@@ -9,6 +9,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.res.Configuration;
 import android.net.ConnectivityManager;
 import android.net.LinkProperties;
 import android.net.Network;
@@ -16,14 +17,10 @@ import android.net.NetworkCapabilities;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.Binder;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.os.Parcel;
 import android.os.PowerManager;
-import android.os.RemoteException;
-import android.os.ResultReceiver;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -55,11 +52,11 @@ public class VmService extends Service
     public static final String ACTION_RESET = "com.avf.linux.ACTION_RESET";
     public static final String ACTION_TOGGLE_WAKELOCK = "com.avf.linux.ACTION_TOGGLE_WAKELOCK";
     public static final String ACTION_SET_WAKELOCK = "com.avf.linux.ACTION_SET_WAKELOCK";
+    public static final String ACTION_TOGGLE_OVERLAY = "com.avf.linux.ACTION_TOGGLE_OVERLAY";
+    public static final String ACTION_SET_OVERLAY = "com.avf.linux.ACTION_SET_OVERLAY";
     public static final String ACTION_ENSURE_FOREGROUND = "com.avf.linux.ACTION_ENSURE_FOREGROUND";
     public static final String EXTRA_TOKEN = "token";
     public static final String EXTRA_ENABLE = "enable";
-    private static final String EXTRA_BINDER = "binder";
-    private static final long KEEPALIVE_ACTIVE_WINDOW_MS = 15000L;
     private static final long FREEZE_TICK_MS = 1000L;
     private static final long FREEZE_STALL_THRESHOLD_MS = 2000L;
 
@@ -70,20 +67,6 @@ public class VmService extends Service
     }
 
     private final IBinder mBinder = new LocalBinder();
-    private final Binder mKeepAliveBinder = new Binder() {
-        @Override
-        protected boolean onTransact(int code, Parcel data, Parcel reply, int flags)
-                throws RemoteException {
-            if (code == FIRST_CALL_TRANSACTION) {
-                mLastKeepAliveElapsedMs = SystemClock.elapsedRealtime();
-                if (reply != null) {
-                    reply.writeNoException();
-                }
-                return true;
-            }
-            return super.onTransact(code, data, reply, flags);
-        }
-    };
     private final Handler mMainHandler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean mFgSyncScheduled = new AtomicBoolean(false);
     private final Object mWakeLockGuard = new Object();
@@ -93,6 +76,7 @@ public class VmService extends Service
     private byte[] mTokenBytes;
     private VmController mController;
     private VmControlServer mCtlServer;
+    private VmOverlayManager mOverlayManager;
 
     private PowerManager.WakeLock mWakeLock;
     private WifiManager.WifiLock mWifiLock;
@@ -105,7 +89,6 @@ public class VmService extends Service
     private volatile int mLastStartId = -1;
     private volatile boolean mDestroyed = false;
 
-    private volatile long mLastKeepAliveElapsedMs = 0L;
     private final AtomicInteger mFreezeCount = new AtomicInteger(0);
     private volatile long mLastFreezeMs = 0L;
     private volatile long mLastFreezeAtElapsedMs = 0L;
@@ -136,14 +119,30 @@ public class VmService extends Service
 
         Properties initialProps = mStore.loadSettings();
         mController = new VmController(this, initialProps, mStore);
+        mOverlayManager = new VmOverlayManager(this, mStore);
 
         ensureNotificationChannel();
         registerShutdownReceiver();
         registerNetworkMonitor();
         startFreezeMonitor();
+        mOverlayManager.sync(mController.getStatus());
 
         mCtlServer = new VmControlServer(mController.getStatus().ctlPort, mToken, this);
         mCtlServer.start();
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (mOverlayManager != null) {
+            mOverlayManager.onConfigurationChanged();
+        }
+    }
+
+    public void syncOverlay() {
+        if (mOverlayManager != null && mController != null) {
+            mOverlayManager.sync(mController.getStatus());
+        }
     }
 
     @Override
@@ -179,17 +178,6 @@ public class VmService extends Service
 
         String action = (intent != null) ? intent.getAction() : null;
         if (action == null) {
-            if (intent != null) {
-                try {
-                    ResultReceiver rr = intent.getParcelableExtra(Intent.EXTRA_RESULT_RECEIVER);
-                    if (rr != null) {
-                        mLastKeepAliveElapsedMs = SystemClock.elapsedRealtime();
-                        Bundle reply = new Bundle(1);
-                        reply.putBinder(EXTRA_BINDER, mKeepAliveBinder);
-                        rr.send(0, reply);
-                    }
-                } catch (Throwable ignored) {}
-            }
             scheduleForegroundSync();
             return mController.getStatus().state.isActive() ? START_STICKY : START_NOT_STICKY;
         }
@@ -226,6 +214,10 @@ public class VmService extends Service
             mController.toggleKeepAwake();
         } else if (ACTION_SET_WAKELOCK.equals(action)) {
             mController.setKeepAwake(intent.getBooleanExtra(EXTRA_ENABLE, false));
+        } else if (ACTION_TOGGLE_OVERLAY.equals(action)) {
+            mController.toggleShowOverlay();
+        } else if (ACTION_SET_OVERLAY.equals(action)) {
+            mController.setShowOverlay(intent.getBooleanExtra(EXTRA_ENABLE, true));
         }
 
         scheduleForegroundSync();
@@ -243,6 +235,9 @@ public class VmService extends Service
     public void onDestroy() {
         mDestroyed = true;
         stopFreezeMonitor();
+        if (mOverlayManager != null) {
+            mOverlayManager.dispose();
+        }
         mMainHandler.removeCallbacks(mSyncForegroundRunnable);
         unregisterShutdownReceiver();
         unregisterNetworkMonitor();
@@ -281,8 +276,6 @@ public class VmService extends Service
     @Override
     public String getStatusJson() {
         long nowElapsed = SystemClock.elapsedRealtime();
-        long lastKa = mLastKeepAliveElapsedMs;
-        boolean kaActive = (lastKa > 0L) && ((nowElapsed - lastKa) <= KEEPALIVE_ACTIVE_WINDOW_MS);
         long lastFreezeAt = mLastFreezeAtElapsedMs;
         long freezeAgoSec = (lastFreezeAt > 0L)
             ? Math.max(0L, (nowElapsed - lastFreezeAt) / 1000L)
@@ -292,7 +285,7 @@ public class VmService extends Service
             mWifiLockHeld,
             isBatteryOptimizationIgnored(),
             mForegroundActive,
-            kaActive,
+            mOverlayManager != null && mOverlayManager.isAttached(),
             mFreezeCount.get(),
             mLastFreezeMs,
             freezeAgoSec,
@@ -318,6 +311,8 @@ public class VmService extends Service
     @Override public int requestReset() { return mController.requestReset(); }
     @Override public void setKeepAwake(boolean enable) { mController.setKeepAwake(enable); }
     @Override public void toggleKeepAwake() { mController.toggleKeepAwake(); }
+    @Override public void setShowOverlay(boolean enable) { mController.setShowOverlay(enable); }
+    @Override public void toggleShowOverlay() { mController.toggleShowOverlay(); }
 
     // -------------------------------------------------------------------------
     // VmSession.Observer
@@ -362,6 +357,7 @@ public class VmService extends Service
     @Override public boolean hasStagingImage() { return mStore.findStagingImage() != null; }
     @Override public boolean hasSeedImage() { return mStore.hasSeed(); }
     @Override public void saveKeepAwake(boolean enable) { mStore.saveKeepAwake(enable); }
+    @Override public void saveShowOverlay(boolean enable) { mStore.saveShowOverlay(enable); }
 
     @Override
     public VmController.SessionHandle bootSession(
@@ -397,12 +393,18 @@ public class VmService extends Service
     public void onStateInvalidated() {
         applyWakeLockProjection();
         scheduleForegroundSync();
+        if (mOverlayManager != null && mController != null) {
+            mOverlayManager.sync(mController.getStatus());
+        }
     }
 
     @Override
     public void onIdleServiceExitRequested(final int startId) {
         mMainHandler.post(() -> {
             if (mDestroyed) return;
+            if (mOverlayManager != null && mController != null) {
+                mOverlayManager.sync(mController.getStatus());
+            }
             mServiceStarted = false;
             mForegroundActive = false;
             mLastNotifiedSeq = -1L;

@@ -209,6 +209,7 @@ public final class VmConfigStore {
         props.setProperty("ssh_vsock_port", String.valueOf(DEFAULT_SSH_VSOCK_PORT));
         props.setProperty("ctl_port", String.valueOf(DEFAULT_CTL_PORT));
         props.setProperty("keep_awake", "false");
+        props.setProperty("show_overlay", "true");
         File f = new File(mContext.getFilesDir(), "vm.properties");
         if (f.isFile()) {
             try (FileInputStream fis = new FileInputStream(f)) {
@@ -222,6 +223,24 @@ public final class VmConfigStore {
         Properties props = loadSettings();
         props.remove("wakelock_mode");
         props.setProperty("keep_awake", Boolean.toString(enable));
+        storePropertiesLocked(props);
+    }
+
+    public synchronized void saveShowOverlay(boolean enable) {
+        Properties props = loadSettings();
+        props.setProperty("show_overlay", Boolean.toString(enable));
+        storePropertiesLocked(props);
+    }
+
+    public synchronized void saveOverlayGeometry(int x, int y, boolean compact) {
+        Properties props = loadSettings();
+        props.setProperty("overlay_x", Integer.toString(x));
+        props.setProperty("overlay_y", Integer.toString(y));
+        props.setProperty("overlay_compact", Boolean.toString(compact));
+        storePropertiesLocked(props);
+    }
+
+    private void storePropertiesLocked(Properties props) {
         File tmp = new File(mContext.getFilesDir(), "vm.properties.tmp");
         File dst = new File(mContext.getFilesDir(), "vm.properties");
         try (FileOutputStream fos = new FileOutputStream(tmp)) {

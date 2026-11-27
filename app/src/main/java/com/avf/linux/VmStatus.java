@@ -40,6 +40,7 @@ public final class VmStatus {
     public final boolean vmNetConnected;
     public final boolean keepAwake;
     public final boolean wakeLockHeld;
+    public final boolean showOverlay;
     public final int memMib;
     public final int diskGb;
     public final int sshPort;
@@ -55,6 +56,7 @@ public final class VmStatus {
             boolean vmNetConnected,
             boolean keepAwake,
             boolean wakeLockHeld,
+            boolean showOverlay,
             int memMib,
             int diskGb,
             int sshPort,
@@ -68,6 +70,7 @@ public final class VmStatus {
         this.vmNetConnected = vmNetConnected;
         this.keepAwake = keepAwake;
         this.wakeLockHeld = wakeLockHeld;
+        this.showOverlay = showOverlay;
         this.memMib = memMib;
         this.diskGb = diskGb;
         this.sshPort = sshPort;
@@ -85,6 +88,7 @@ public final class VmStatus {
             false,
             false,
             false,
+            true,
             VmConfigStore.DEFAULT_MEM_MIB,
             VmConfigStore.DEFAULT_DISK_GB,
             VmConfigStore.DEFAULT_SSH_LOCAL_PORT,
@@ -104,6 +108,7 @@ public final class VmStatus {
             false,
             store.getBoolProp(p, "keep_awake", false),
             false,
+            store.getBoolProp(p, "show_overlay", true),
             store.getIntProp(p, "memory_mib", VmConfigStore.DEFAULT_MEM_MIB),
             store.getIntProp(p, "disk_gb", VmConfigStore.DEFAULT_DISK_GB),
             store.getIntProp(p, "ssh_local_port", VmConfigStore.DEFAULT_SSH_LOCAL_PORT),
@@ -122,6 +127,26 @@ public final class VmStatus {
             vmNetConnected,
             nextKeepAwake,
             nextWakeLockHeld,
+            showOverlay,
+            memMib,
+            diskGb,
+            sshPort,
+            ctlPort,
+            startedAtMs,
+            lastError
+        );
+    }
+
+    public VmStatus withShowOverlay(long nextSeq, boolean nextShowOverlay) {
+        return new VmStatus(
+            nextSeq,
+            state,
+            guestIp,
+            netMode,
+            vmNetConnected,
+            keepAwake,
+            wakeLockHeld,
+            nextShowOverlay,
             memMib,
             diskGb,
             sshPort,
@@ -136,7 +161,7 @@ public final class VmStatus {
         public final boolean wifiLockHeld;
         public final boolean batteryUnrestricted;
         public final boolean foregroundActive;
-        public final boolean keepAliveActive;
+        public final boolean overlayShown;
         public final int freezeCount;
         public final long lastFreezeMs;
         public final long lastFreezeAgoSec;
@@ -148,7 +173,7 @@ public final class VmStatus {
                 boolean wifiLockHeld,
                 boolean batteryUnrestricted,
                 boolean foregroundActive,
-                boolean keepAliveActive,
+                boolean overlayShown,
                 int freezeCount,
                 long lastFreezeMs,
                 long lastFreezeAgoSec,
@@ -158,7 +183,7 @@ public final class VmStatus {
             this.wifiLockHeld = wifiLockHeld;
             this.batteryUnrestricted = batteryUnrestricted;
             this.foregroundActive = foregroundActive;
-            this.keepAliveActive = keepAliveActive;
+            this.overlayShown = overlayShown;
             this.freezeCount = freezeCount;
             this.lastFreezeMs = lastFreezeMs;
             this.lastFreezeAgoSec = lastFreezeAgoSec;
@@ -184,9 +209,10 @@ public final class VmStatus {
             + ",\"keep_awake\":" + keepAwake
             + ",\"wakelock_held\":" + diag.wakeLockHeld
             + ",\"wifilock_held\":" + diag.wifiLockHeld
+            + ",\"show_overlay\":" + showOverlay
+            + ",\"overlay_shown\":" + diag.overlayShown
             + ",\"battery_unrestricted\":" + diag.batteryUnrestricted
             + ",\"foreground_service\":" + diag.foregroundActive
-            + ",\"keepalive_active\":" + diag.keepAliveActive
             + ",\"freeze_count\":" + diag.freezeCount
             + ",\"last_freeze_ms\":" + diag.lastFreezeMs
             + ",\"last_freeze_ago_sec\":" + diag.lastFreezeAgoSec

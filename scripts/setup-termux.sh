@@ -23,13 +23,9 @@ BIN_DIR="${PREFIX:-/usr/local}/bin"
 mkdir -p "$BIN_DIR" "$HOME/.ssh" "$HOME/.config/avf-linux"
 chmod 700 "$HOME/.ssh" "$HOME/.config/avf-linux"
 
-# 1. Install or update avf-vm, binder-keepalive & avf-adb CLIs
+# 1. Install or update avf-vm & avf-adb CLIs
 install -m 755 "$SCRIPT_DIR/avf-vm" "$BIN_DIR/avf-vm"
 echo "[ok] Installed CLI: $BIN_DIR/avf-vm"
-if [[ -f "$SCRIPT_DIR/binder-keepalive" ]]; then
-    install -m 755 "$SCRIPT_DIR/binder-keepalive" "$BIN_DIR/binder-keepalive"
-    echo "[ok] Installed CLI: $BIN_DIR/binder-keepalive"
-fi
 if [[ -f "$SCRIPT_DIR/avf-adb" ]]; then
     install -m 755 "$SCRIPT_DIR/avf-adb" "$BIN_DIR/avf-adb"
     echo "[ok] Installed CLI: $BIN_DIR/avf-adb"
@@ -140,11 +136,11 @@ fi
 
 echo ""
 echo "Done. Usage:"
-echo "  avf-vm status              # check VM state, storage, and WakeLock"
+echo "  avf-vm status              # check VM state, storage, overlay, and WakeLock"
 echo "  avf-vm start               # start Debian 13 (works with or without ADB)"
+echo "  avf-vm overlay [on|off]    # toggle floating VM status pill (default: on)"
 echo "  avf-vm wakelock [on|off]   # toggle host CPU WakeLock (default: off)"
 echo "  avf-vm reset               # restore initial Debian 13 image from seed"
 echo "  ssh avf                    # passwordless Ed25519 SSH via local vsock"
-echo "  binder-keepalive start com.avf.linux/.VmService  # optional Binder keepalive while Termux is active"
 echo "  avf-adb [on|status|off]    # optional decoupled host ADB tunnel (127.0.0.1:15555)"
 echo "  avf-vm stop                # graceful poweroff"

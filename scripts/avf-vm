@@ -115,6 +115,17 @@ if d.get("wakelock_held"):
 else:
     wl_held = "host sleep allowed"
 print(f"WakeLock : {wl_pref} ({wl_held})")
+if "show_overlay" in d:
+    if d.get("show_overlay"):
+        if d.get("overlay_shown"):
+            fl_str = "ON (active)"
+        elif d.get("running"):
+            fl_str = "ON (allow Display over other apps in AVF Linux)"
+        else:
+            fl_str = "ON (standby)"
+    else:
+        fl_str = "OFF"
+    print(f"Float    : {fl_str}")
 if "battery_unrestricted" in d:
     bg_ok = d.get("battery_unrestricted")
     fg_note = ""
@@ -123,7 +134,6 @@ if "battery_unrestricted" in d:
     bg_str = "UNRESTRICTED" if bg_ok else "OPTIMIZED (open AVF Linux app to allow unrestricted background usage)"
     print(f"BgPolicy : {bg_str}{fg_note}")
 if "freeze_count" in d:
-    ka_str = "KeepAlive ON" if d.get("keepalive_active") else "KeepAlive OFF"
     fc = int(d.get("freeze_count") or 0)
     if fc > 0:
         lf_ms = int(d.get("last_freeze_ms") or 0)
@@ -135,7 +145,7 @@ if "freeze_count" in d:
     nb = bool(d.get("net_blocked"))
     nbc = int(d.get("net_blocked_count") or 0)
     nb_str = f"net_blocked={str(nb).lower()}" + (f" (events={nbc})" if nbc > 0 else "")
-    print(f"BgHealth : {ka_str}, {fr_str}, {nb_str}")
+    print(f"BgHealth : {fr_str}, {nb_str}")
 if d.get("uptime_sec"):
     up_s = d["uptime_sec"]
     print(f"Uptime   : {up_s}s")
@@ -396,6 +406,44 @@ cmd_wakelock() {
     esac
 }
 
+cmd_overlay() {
+    local mode="${1:-status}"
+    local out=""
+    case "$mode" in
+        on)
+            if out="$(api_call POST /overlay/on 2>/dev/null)"; then
+                print_status_json "$out"
+            else
+                wake_service_action "overlay_on" "com.avf.linux.ACTION_SET_OVERLAY" --ez enable true
+                echo "Floating status pill ON requested."
+            fi
+            ;;
+        off)
+            if out="$(api_call POST /overlay/off 2>/dev/null)"; then
+                print_status_json "$out"
+            else
+                wake_service_action "overlay_off" "com.avf.linux.ACTION_SET_OVERLAY" --ez enable false
+                echo "Floating status pill OFF requested."
+            fi
+            ;;
+        toggle)
+            if out="$(api_call POST /overlay/toggle 2>/dev/null)"; then
+                print_status_json "$out"
+            else
+                wake_service_action "overlay_toggle" "com.avf.linux.ACTION_TOGGLE_OVERLAY"
+                echo "Floating status pill toggle requested."
+            fi
+            ;;
+        status)
+            cmd_status
+            ;;
+        *)
+            echo "Usage: avf-vm overlay [on|off|toggle|status]" >&2
+            return 2
+            ;;
+    esac
+}
+
 cmd_console() {
     case "${1:-}" in
         --last)  api_call GET /console/last ;;
@@ -467,6 +515,7 @@ Commands:
   restart                  Stop and start the VM
   reset [--yes]            Erase disk changes and restore initial Debian 13 seed image
   status [--json]          Show VM status (pass --json for raw JSON)
+  overlay [on|off|toggle]  Inspect or change floating status pill (default: on)
   wakelock [on|off|toggle] Inspect or change host CPU + Wi-Fi WakeLock policy (default: off)
   ssh [cmd]                Open SSH shell (or execute remote command) via loopback vsock
   console [--last|--vmlog] Print hvc0 console (or previous session / crosvm log)
@@ -480,6 +529,7 @@ case "${1:-}" in
     restart)  cmd_restart ;;
     reset)    shift; cmd_reset "$@" ;;
     status)   shift; cmd_status "$@" ;;
+    overlay)  shift; cmd_overlay "$@" ;;
     wakelock) shift; cmd_wakelock "$@" ;;
     ssh)      shift; cmd_ssh "$@" ;;
     console)  shift; cmd_console "$@" ;;

@@ -42,6 +42,8 @@ final class VmControlServer {
         int requestReset();
         void setKeepAwake(boolean enable);
         void toggleKeepAwake();
+        void setShowOverlay(boolean enable);
+        void toggleShowOverlay();
     }
 
     private final int mPort;
@@ -207,6 +209,15 @@ final class VmControlServer {
                 writeHttp(sock, 200, "OK", "application/json", mController.getStatusJson());
             } else if ("POST".equals(method) && "/wakelock/toggle".equals(path)) {
                 mController.toggleKeepAwake();
+                writeHttp(sock, 200, "OK", "application/json", mController.getStatusJson());
+            } else if ("POST".equals(method) && "/overlay/on".equals(path)) {
+                mController.setShowOverlay(true);
+                writeHttp(sock, 200, "OK", "application/json", mController.getStatusJson());
+            } else if ("POST".equals(method) && "/overlay/off".equals(path)) {
+                mController.setShowOverlay(false);
+                writeHttp(sock, 200, "OK", "application/json", mController.getStatusJson());
+            } else if ("POST".equals(method) && "/overlay/toggle".equals(path)) {
+                mController.toggleShowOverlay();
                 writeHttp(sock, 200, "OK", "application/json", mController.getStatusJson());
             } else {
                 writeHttp(sock, 404, "Not Found", "application/json", "{\"error\":\"not_found\"}\n");

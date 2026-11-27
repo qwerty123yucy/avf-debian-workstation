@@ -277,6 +277,7 @@ public class MainActivity extends Activity {
     private TextView mBtnImport;
     private TextView mBtnReset;
     private TextView mBtnWakeLock;
+    private TextView mBtnOverlay;
     private AlertDialog mConfirmDialog;
 
     private TextView mConsoleMeta;
@@ -302,6 +303,7 @@ public class MainActivity extends Activity {
     private long mLastStateSeq = -1L;
     private long mLastConsoleSeq = -1L;
     private Boolean mLastBatteryUnrestricted = null;
+    private Boolean mLastCanDrawOverlays = null;
     private boolean mBatteryPromptShown = false;
 
     private final ServiceConnection mServiceConn = new ServiceConnection() {
@@ -451,6 +453,9 @@ public class MainActivity extends Activity {
         else if ("wakelock_on".equals(action)) sendWakeLockSet(true);
         else if ("wakelock_off".equals(action)) sendWakeLockSet(false);
         else if ("wakelock_toggle".equals(action)) sendVmAction(VmService.ACTION_TOGGLE_WAKELOCK);
+        else if ("overlay_on".equals(action)) sendOverlaySet(true);
+        else if ("overlay_off".equals(action)) sendOverlaySet(false);
+        else if ("overlay_toggle".equals(action)) sendVmAction(VmService.ACTION_TOGGLE_OVERLAY);
 
         if (goBack) {
             moveTaskToBack(true);
@@ -466,6 +471,7 @@ public class MainActivity extends Activity {
         if (mService != null) {
             mService.getController().addListener(mVmListener);
             healServiceForegroundIfActive();
+            mService.syncOverlay();
             runPendingAutoActionIfReady();
         }
         refreshUi();
@@ -681,45 +687,58 @@ public class MainActivity extends Activity {
         rowPrimary.addView(mBtnRestart, new LinearLayout.LayoutParams(0, dp(48), 1f));
         mOverviewPage.addView(rowPrimary, row1Lp);
 
-        // Utility Chips Row (Copy SSH | Copy Token | Reset)
-        LinearLayout rowUtil = new LinearLayout(this);
-        rowUtil.setOrientation(LinearLayout.HORIZONTAL);
+        // Background & Power Row (Float | WakeLock)
+        LinearLayout rowPower = new LinearLayout(this);
+        rowPower.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams row2Lp = new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         row2Lp.topMargin = dp(10);
 
+        mBtnOverlay = makePillButton("Float: On", 40, v -> toggleOverlayPref());
+        mBtnWakeLock = makePillButton("WakeLock: Off", 40, v -> toggleWakeLockPref());
+        styleOutlinedChip(mBtnOverlay);
+        styleOutlinedChip(mBtnWakeLock);
+
+        rowPower.addView(mBtnOverlay, utilLp(0, 8, 1f));
+        rowPower.addView(mBtnWakeLock, utilLp(0, 0, 1f));
+        mOverviewPage.addView(rowPower, row2Lp);
+
+        // Utility Chips Row (Copy SSH | Copy Token | Settings)
+        LinearLayout rowUtil = new LinearLayout(this);
+        rowUtil.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams row3Lp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        row3Lp.topMargin = dp(8);
+
         TextView btnCopySsh = makePillButton("Copy SSH", 40, v -> copyText("ssh avf", "Copied: ssh avf"));
         TextView btnCopyTok = makePillButton("Copy Token", 40, v -> copyText(mStore.getOrCreateToken(), "Control token copied"));
-        mBtnReset = makePillButton("Reset VM", 40, v -> confirmResetVm());
+        TextView btnAppInfo = makePillButton("Settings", 40, v -> openAppSettings());
 
         styleOutlinedChip(btnCopySsh);
         styleOutlinedChip(btnCopyTok);
-        styleOutlinedChip(mBtnReset);
-
-        rowUtil.addView(btnCopySsh, utilLp(0, 8, 1f));
-        rowUtil.addView(btnCopyTok, utilLp(0, 8, 1f));
-        rowUtil.addView(mBtnReset, utilLp(0, 0, 1f));
-        mOverviewPage.addView(rowUtil, row2Lp);
-
-        // Power & Image Management Row (WakeLock | Import | Settings)
-        LinearLayout rowPower = new LinearLayout(this);
-        rowPower.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams row3Lp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        row3Lp.topMargin = dp(10);
-
-        mBtnWakeLock = makePillButton("WakeLock: Off", 40, v -> toggleWakeLockPref());
-        mBtnImport = makePillButton("Import", 40, v -> confirmImportVm());
-        TextView btnAppInfo = makePillButton("Settings", 40, v -> openAppSettings());
-        styleOutlinedChip(mBtnWakeLock);
-        styleOutlinedChip(mBtnImport);
         styleOutlinedChip(btnAppInfo);
         btnAppInfo.setTextColor(mPal.onSurfaceVariant);
 
-        rowPower.addView(mBtnWakeLock, utilLp(0, 8, 1.25f));
-        rowPower.addView(mBtnImport, utilLp(0, 8, 0.85f));
-        rowPower.addView(btnAppInfo, utilLp(0, 0, 0.9f));
-        mOverviewPage.addView(rowPower, row3Lp);
+        rowUtil.addView(btnCopySsh, utilLp(0, 8, 1f));
+        rowUtil.addView(btnCopyTok, utilLp(0, 8, 1f));
+        rowUtil.addView(btnAppInfo, utilLp(0, 0, 1f));
+        mOverviewPage.addView(rowUtil, row3Lp);
+
+        // Image Management Row (Import | Reset VM)
+        LinearLayout rowDisk = new LinearLayout(this);
+        rowDisk.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams row4Lp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        row4Lp.topMargin = dp(8);
+
+        mBtnImport = makePillButton("Import", 40, v -> confirmImportVm());
+        mBtnReset = makePillButton("Reset VM", 40, v -> confirmResetVm());
+        styleOutlinedChip(mBtnImport);
+        styleOutlinedChip(mBtnReset);
+
+        rowDisk.addView(mBtnImport, utilLp(0, 8, 1f));
+        rowDisk.addView(mBtnReset, utilLp(0, 0, 1f));
+        mOverviewPage.addView(rowDisk, row4Lp);
 
         root.addView(mOverviewPage, new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -1062,6 +1081,49 @@ public class MainActivity extends Activity {
         i.putExtra(VmService.EXTRA_ENABLE, enable);
         startForegroundService(i);
         refreshUi();
+    }
+
+    private void toggleOverlayPref() {
+        boolean canDraw = Settings.canDrawOverlays(this);
+        boolean current = currentStatus().showOverlay;
+        if (!canDraw) {
+            if (!current) {
+                sendOverlaySet(true);
+            }
+            requestOverlayPermission();
+            return;
+        }
+        boolean next = !current;
+        sendOverlaySet(next);
+        Toast.makeText(this,
+            next ? "Floating pill ON (drag to move, long-press for mini dot)"
+                 : "Floating pill OFF",
+            Toast.LENGTH_SHORT).show();
+    }
+
+    private void sendOverlaySet(boolean enable) {
+        if (mService != null) {
+            mService.setShowOverlay(enable);
+            return;
+        }
+        mStore.saveShowOverlay(enable);
+        mFallbackStatus = mFallbackStatus.withShowOverlay(mFallbackStatus.seq + 1, enable);
+        Intent i = new Intent(this, VmService.class);
+        i.setAction(VmService.ACTION_SET_OVERLAY);
+        i.putExtra(VmService.EXTRA_TOKEN, mStore.getOrCreateToken());
+        i.putExtra(VmService.EXTRA_ENABLE, enable);
+        startForegroundService(i);
+        refreshUi();
+    }
+
+    private void requestOverlayPermission() {
+        try {
+            Intent i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:" + getPackageName()));
+            startActivity(i);
+            return;
+        } catch (Throwable ignored) {}
+        openAppSettings();
     }
 
     private boolean hasCoreVmPermissions() {
@@ -1412,6 +1474,7 @@ public class MainActivity extends Activity {
             else if (VmService.ACTION_IMPORT.equals(action)) mService.requestImportStaging();
             else if (VmService.ACTION_RESET.equals(action)) mService.requestReset();
             else if (VmService.ACTION_TOGGLE_WAKELOCK.equals(action)) mService.toggleKeepAwake();
+            else if (VmService.ACTION_TOGGLE_OVERLAY.equals(action)) mService.toggleShowOverlay();
             return;
         }
         Intent i = new Intent(this, VmService.class);
@@ -1432,11 +1495,14 @@ public class MainActivity extends Activity {
         final VmStatus status = currentStatus();
         long stateSeq = status.seq;
         boolean batteryUnrestricted = isBatteryOptimizationIgnored();
+        boolean canDrawOverlays = Settings.canDrawOverlays(this);
         boolean stateChanged = (stateSeq != mLastStateSeq)
-            || (mLastBatteryUnrestricted == null || mLastBatteryUnrestricted.booleanValue() != batteryUnrestricted);
+            || (mLastBatteryUnrestricted == null || mLastBatteryUnrestricted.booleanValue() != batteryUnrestricted)
+            || (mLastCanDrawOverlays == null || mLastCanDrawOverlays.booleanValue() != canDrawOverlays);
         if (stateChanged) {
             mLastStateSeq = stateSeq;
             mLastBatteryUnrestricted = Boolean.valueOf(batteryUnrestricted);
+            mLastCanDrawOverlays = Boolean.valueOf(canDrawOverlays);
             boolean hasManage = checkSelfPermission(PERM_MANAGE_VM) == PackageManager.PERMISSION_GRANTED;
             boolean hasCustom = checkSelfPermission(PERM_CUSTOM_VM) == PackageManager.PERMISSION_GRANTED;
             VmStatus.State st = status.state;
@@ -1460,6 +1526,12 @@ public class MainActivity extends Activity {
                 mPermBanner.setBackground(pillButtonBg(mPal.warnContainer, 0, 14));
                 mPermBanner.setOnClickListener(v -> requestIgnoreBatteryOptimizations());
                 mPermBanner.setText("Background optimization active — Android may throttle or freeze SSH & VM network in background. Tap here to allow unrestricted background usage.");
+            } else if (status.showOverlay && !canDrawOverlays) {
+                mPermBanner.setVisibility(View.VISIBLE);
+                mPermBanner.setTypeface(Typeface.SANS_SERIF);
+                mPermBanner.setBackground(pillButtonBg(mPal.warnContainer, 0, 14));
+                mPermBanner.setOnClickListener(v -> requestOverlayPermission());
+                mPermBanner.setText("Floating status pill enabled — tap here to allow 'Display over other apps' so OEM freezers keep the VM responsive in background.");
             } else {
                 mPermBanner.setOnClickListener(null);
                 mPermBanner.setClickable(false);
@@ -1537,6 +1609,21 @@ public class MainActivity extends Activity {
             mBtnReset.setAlpha(canReset ? 1f : 0.45f);
             mBtnReset.setTextColor(mPal.errDot);
             mBtnReset.setBackground(pillButtonBg(mPal.surfaceContainer, mPal.outlineVariant, 20));
+
+            if (status.showOverlay) {
+                if (canDrawOverlays) {
+                    mBtnOverlay.setText("Float: On");
+                    mBtnOverlay.setTextColor(mPal.onPrimaryContainer);
+                    mBtnOverlay.setBackground(pillButtonBg(mPal.primaryContainer, 0, 20));
+                } else {
+                    mBtnOverlay.setText("Float: Grant");
+                    mBtnOverlay.setTextColor(mPal.onWarnContainer);
+                    mBtnOverlay.setBackground(pillButtonBg(mPal.warnContainer, 0, 20));
+                }
+            } else {
+                mBtnOverlay.setText("Float: Off");
+                styleOutlinedChip(mBtnOverlay);
+            }
 
             if (status.keepAwake) {
                 mBtnWakeLock.setText("WakeLock: On");

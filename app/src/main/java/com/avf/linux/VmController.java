@@ -108,6 +108,7 @@ public final class VmController {
         boolean hasStagingImage();
         boolean hasSeedImage();
         void saveKeepAwake(boolean enable);
+        void saveShowOverlay(boolean enable);
         SessionHandle bootSession(long sessionId, long generation, ExecutorService callbackExecutor) throws Exception;
         String runImportStaging(int diskGb) throws Exception;
         String runResetSeed(int diskGb) throws Exception;
@@ -189,6 +190,7 @@ public final class VmController {
     private boolean mVmNetConnected = false;
     private boolean mKeepAwake = false;
     private boolean mWakeLockHeld = false;
+    private boolean mShowOverlay = true;
     private int mMemMib = VmConfigStore.DEFAULT_MEM_MIB;
     private int mDiskGb = VmConfigStore.DEFAULT_DISK_GB;
     private int mSshPort = VmConfigStore.DEFAULT_SSH_LOCAL_PORT;
@@ -208,6 +210,7 @@ public final class VmController {
                 mSshPort = store.getIntProp(initialProps, "ssh_local_port", VmConfigStore.DEFAULT_SSH_LOCAL_PORT);
                 mCtlPort = store.getIntProp(initialProps, "ctl_port", VmConfigStore.DEFAULT_CTL_PORT);
                 mKeepAwake = store.getBoolProp(initialProps, "keep_awake", false);
+                mShowOverlay = store.getBoolProp(initialProps, "show_overlay", true);
             }
             assertInvariantLocked();
             mPublishedStatus = snapshotStatusLocked();
@@ -314,6 +317,31 @@ public final class VmController {
             next = !mKeepAwake;
         }
         setKeepAwake(next);
+    }
+
+    public void setShowOverlay(boolean enable) {
+        boolean changed = false;
+        synchronized (mLock) {
+            if (mShowOverlay != enable) {
+                mShowOverlay = enable;
+                mPublishedStatus = snapshotStatusLocked();
+                changed = true;
+            }
+        }
+        mHost.saveShowOverlay(enable);
+        if (changed) {
+            appendLog("[AVF Linux] Floating status pill: " + (enable ? "ON" : "OFF") + "\n");
+        }
+        mHost.onStateInvalidated();
+        notifyListeners();
+    }
+
+    public void toggleShowOverlay() {
+        boolean next;
+        synchronized (mLock) {
+            next = !mShowOverlay;
+        }
+        setShowOverlay(next);
     }
 
     public void updateWakeLockHeld(boolean held) {
@@ -933,6 +961,7 @@ public final class VmController {
             mVmNetConnected,
             mKeepAwake,
             mWakeLockHeld,
+            mShowOverlay,
             mMemMib,
             mDiskGb,
             mSshPort,
